@@ -116,13 +116,18 @@ impl ModrinthClient {
     }
 
     pub fn new_from_env() -> Result<Self> {
-        let base_url = env::var("MODRINTH_API_BASE").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
+        let base_url =
+            env::var("MODRINTH_API_BASE").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
         Self::new(base_url)
     }
 
     pub fn get_project(&self, id_or_slug: &str) -> Result<Option<Project>> {
         let url = format!("{}/project/{}", self.base_url, id_or_slug);
-        let response = self.http.get(url).send().context("failed to fetch project")?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .context("failed to fetch project")?;
 
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);

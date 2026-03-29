@@ -113,7 +113,10 @@ fn install_from_query(
 fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> {
     let installed = build_installed_inventory(client, context)?;
     if installed.is_empty() {
-        println!("No Modrinth-backed mods found in {}", context.mods_dir.display());
+        println!(
+            "No Modrinth-backed mods found in {}",
+            context.mods_dir.display()
+        );
         return Ok(());
     }
 
@@ -134,7 +137,9 @@ fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()>
             None => {
                 println!(
                     "Skipped {}: no compatible update found for {} {}",
-                    item.project.title, context.environment.loader, context.environment.minecraft_version
+                    item.project.title,
+                    context.environment.loader,
+                    context.environment.minecraft_version
                 );
             }
         }
@@ -150,7 +155,10 @@ fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()>
 fn update_named(client: &ModrinthClient, context: &MinecraftContext, query: &str) -> Result<()> {
     let installed = build_installed_inventory(client, context)?;
     if installed.is_empty() {
-        bail!("no installed Modrinth-backed mods were found in {}", context.mods_dir.display());
+        bail!(
+            "no installed Modrinth-backed mods were found in {}",
+            context.mods_dir.display()
+        );
     }
 
     let candidates: Vec<SearchCandidate> = installed
@@ -233,8 +241,8 @@ fn install_project_recursive(
                 continue;
             }
 
-            let dependency_project =
-                fetch_project_cached(client, project_cache, &project_id)?.ok_or_else(|| {
+            let dependency_project = fetch_project_cached(client, project_cache, &project_id)?
+                .ok_or_else(|| {
                     anyhow!("dependency project {project_id} could not be loaded from Modrinth")
                 })?;
 
@@ -410,16 +418,21 @@ fn resolve_project_query(
 
     let selected_hit = hits
         .iter()
-        .find(|hit| hit.project_id.as_deref() == Some(selected_key.as_str()) || hit.slug == selected_key)
+        .find(|hit| {
+            hit.project_id.as_deref() == Some(selected_key.as_str()) || hit.slug == selected_key
+        })
         .ok_or_else(|| anyhow!("selected search hit disappeared before project fetch"))?;
 
     let lookup_key = selected_hit
         .project_id
         .as_deref()
         .unwrap_or(selected_hit.slug.as_str());
-    let project = client
-        .get_project(lookup_key)?
-        .ok_or_else(|| anyhow!("Modrinth project {} could not be fetched", selected_hit.title))?;
+    let project = client.get_project(lookup_key)?.ok_or_else(|| {
+        anyhow!(
+            "Modrinth project {} could not be fetched",
+            selected_hit.title
+        )
+    })?;
     project_cache.insert(project.id.clone(), project.clone());
     Ok(project)
 }
@@ -440,7 +453,8 @@ fn build_installed_inventory(
             continue;
         };
 
-        let Some(project) = fetch_project_cached(client, &mut project_cache, &version.project_id)? else {
+        let Some(project) = fetch_project_cached(client, &mut project_cache, &version.project_id)?
+        else {
             continue;
         };
 
@@ -481,8 +495,8 @@ fn scan_installed_jars(mods_dir: &Path) -> Result<Vec<InstalledJar>> {
         return Ok(jars);
     }
 
-    for entry in fs::read_dir(mods_dir)
-        .with_context(|| format!("failed to read {}", mods_dir.display()))?
+    for entry in
+        fs::read_dir(mods_dir).with_context(|| format!("failed to read {}", mods_dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -500,7 +514,8 @@ fn scan_installed_jars(mods_dir: &Path) -> Result<Vec<InstalledJar>> {
 }
 
 fn compute_sha1(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut hasher = Sha1::new();
     let mut buffer = [0u8; 8192];
 
@@ -713,12 +728,81 @@ mod tests {
 
     fn write_fabric_root(root: &Path) {
         fs::create_dir_all(root.join("mods")).unwrap();
-        let fabric_dir = root
-            .join("libraries/net/fabricmc/fabric-loader/0.16.10");
+        let fabric_dir = root.join("libraries/net/fabricmc/fabric-loader/0.16.10");
         fs::create_dir_all(&fabric_dir).unwrap();
         fs::write(
             fabric_dir.join("fabric-loader-0.16.10-1.21.1.jar"),
             b"loader",
+        )
+        .unwrap();
+    }
+
+    fn write_modern_fabric_library_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+
+        let intermediary_dir = root.join("libraries/net/fabricmc/intermediary/1.21.11");
+        fs::create_dir_all(&intermediary_dir).unwrap();
+        fs::write(
+            intermediary_dir.join("intermediary-1.21.11.jar"),
+            b"intermediary",
+        )
+        .unwrap();
+
+        for loader_version in ["0.18.4", "0.18.5"] {
+            let fabric_dir = root.join(format!(
+                "libraries/net/fabricmc/fabric-loader/{loader_version}"
+            ));
+            fs::create_dir_all(&fabric_dir).unwrap();
+            fs::write(
+                fabric_dir.join(format!("fabric-loader-{loader_version}.jar")),
+                b"loader",
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_modern_dot_fabric_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        let fabric_dir = root.join(".fabric/server");
+        fs::create_dir_all(&fabric_dir).unwrap();
+
+        fs::write(
+            fabric_dir.join("fabric-loader-server-0.18.4-minecraft-1.21.11.jar"),
+            b"loader",
+        )
+        .unwrap();
+        fs::write(
+            fabric_dir.join("fabric-loader-server-0.18.5-minecraft-1.21.11.jar"),
+            b"loader",
+        )
+        .unwrap();
+    }
+
+    fn write_fabric_remapped_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+
+        for folder in [
+            "minecraft-1.21.10-0.18.1",
+            "minecraft-1.21.11-0.18.4",
+            "minecraft-1.21.11-0.18.5",
+        ] {
+            let remapped_dir = root.join(format!(".fabric/remappedJars/{folder}"));
+            fs::create_dir_all(&remapped_dir).unwrap();
+            fs::write(remapped_dir.join("client-intermediary.jar"), b"client").unwrap();
+        }
+    }
+
+    fn write_prism_instance_root(instance_root: &Path) {
+        let minecraft_root = instance_root.join("minecraft");
+        fs::create_dir_all(minecraft_root.join("mods")).unwrap();
+        fs::write(
+            instance_root.join("mmc-pack.json"),
+            r#"{
+                "components": [
+                    { "uid": "net.minecraft", "version": "1.21.11" },
+                    { "uid": "net.fabricmc.fabric-loader", "version": "0.18.5" }
+                ]
+            }"#,
         )
         .unwrap();
     }
@@ -729,7 +813,10 @@ mod tests {
         write_fabric_root(temp.path());
 
         let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
-        assert_eq!(fs::canonicalize(&context.root_dir).unwrap(), fs::canonicalize(temp.path()).unwrap());
+        assert_eq!(
+            fs::canonicalize(&context.root_dir).unwrap(),
+            fs::canonicalize(temp.path()).unwrap()
+        );
         assert_eq!(
             fs::canonicalize(&context.mods_dir).unwrap(),
             fs::canonicalize(temp.path().join("mods")).unwrap()
@@ -739,6 +826,63 @@ mod tests {
         assert_eq!(
             context.environment.loader_version.as_deref(),
             Some("0.16.10")
+        );
+    }
+
+    #[test]
+    fn detects_modern_fabric_library_layout() {
+        let temp = tempdir().unwrap();
+        write_modern_fabric_library_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "1.21.11");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.18.5")
+        );
+    }
+
+    #[test]
+    fn detects_dot_fabric_server_layout_and_prefers_latest_loader() {
+        let temp = tempdir().unwrap();
+        write_modern_dot_fabric_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "1.21.11");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.18.5")
+        );
+    }
+
+    #[test]
+    fn detects_fabric_remapped_jars_layout() {
+        let temp = tempdir().unwrap();
+        write_fabric_remapped_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "1.21.11");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.18.5")
+        );
+    }
+
+    #[test]
+    fn detects_prism_launcher_manifest_from_instance_parent() {
+        let temp = tempdir().unwrap();
+        let instance_root = temp.path().join("macos boosted beta");
+        write_prism_instance_root(&instance_root);
+
+        let context = MinecraftContext::discover(&instance_root.join("minecraft/mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "1.21.11");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.18.5")
         );
     }
 
@@ -811,8 +955,12 @@ mod tests {
 
         server.mock(|when, then| {
             when.method(GET).path("/project/proj1");
-            then.status(200)
-                .json_body(mock_project("proj1", "shulkerboxtooltips", "ShulkerBox Tooltips", 5000));
+            then.status(200).json_body(mock_project(
+                "proj1",
+                "shulkerboxtooltips",
+                "ShulkerBox Tooltips",
+                5000,
+            ));
         });
 
         server.mock(|when, then| {
@@ -823,41 +971,37 @@ mod tests {
 
         server.mock(|when, then| {
             when.method(GET).path("/project/proj1/version");
-            then.status(200).json_body(json!([
-                mock_version(
-                    "ver-main",
-                    "proj1",
-                    "2.0.0",
-                    "release",
-                    &mod_sha1,
-                    "shulkerboxtooltips.jar",
-                    &server.url("/files/shulkerboxtooltips.jar"),
-                    json!([
-                        {
-                            "version_id": null,
-                            "project_id": "dep1",
-                            "file_name": null,
-                            "dependency_type": "required"
-                        }
-                    ])
-                )
-            ]));
+            then.status(200).json_body(json!([mock_version(
+                "ver-main",
+                "proj1",
+                "2.0.0",
+                "release",
+                &mod_sha1,
+                "shulkerboxtooltips.jar",
+                &server.url("/files/shulkerboxtooltips.jar"),
+                json!([
+                    {
+                        "version_id": null,
+                        "project_id": "dep1",
+                        "file_name": null,
+                        "dependency_type": "required"
+                    }
+                ])
+            )]));
         });
 
         server.mock(|when, then| {
             when.method(GET).path("/project/dep1/version");
-            then.status(200).json_body(json!([
-                mock_version(
-                    "ver-dep",
-                    "dep1",
-                    "1.0.0",
-                    "release",
-                    &dependency_sha1,
-                    "api-lib.jar",
-                    &server.url("/files/api-lib.jar"),
-                    json!([])
-                )
-            ]));
+            then.status(200).json_body(json!([mock_version(
+                "ver-dep",
+                "dep1",
+                "1.0.0",
+                "release",
+                &dependency_sha1,
+                "api-lib.jar",
+                &server.url("/files/api-lib.jar"),
+                json!([])
+            )]));
         });
 
         server.mock(|when, then| {

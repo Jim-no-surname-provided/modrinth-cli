@@ -1,8 +1,10 @@
+use std::cmp::Ordering;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -101,40 +103,27 @@ fn resolve_root_dir(start: &Path) -> Result<PathBuf> {
 }
 
 fn detect_environment(root: &Path) -> Result<DetectedEnvironment> {
-    detect_fabric(root)
+    detect_launcher_manifest(root)
+        .or_else(|| detect_fabric(root))
         .or_else(|| detect_quilt(root))
         .or_else(|| detect_forge(root))
         .or_else(|| detect_neoforge(root))
-        .with_context(|| format!("failed to detect loader and Minecraft version from {}", root.display()))
+        .with_context(|| {
+            format!(
+                "failed to detect loader and Minecraft version from {}",
+                root.display()
+            )
+        })
 }
 
 fn detect_fabric(root: &Path) -> Option<DetectedEnvironment> {
-    for entry in WalkDir::new(root.join("libraries/net/fabricmc/fabric-loader"))
-        .max_depth(3)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let file_name = entry.file_name().to_string_lossy();
-        if !file_name.starts_with("fabric-loader-") || !file_name.ends_with(".jar") {
-            continue;
-        }
-
-        let loader_version = entry.path().parent()?.file_name()?.to_string_lossy().to_string();
-        let trimmed = file_name
-            .trim_end_matches(".jar")
-            .trim_start_matches("fabric-loader-");
-        let minecraft_version = trimmed.strip_prefix(&(loader_version.clone() + "-"))?.to_string();
-        return Some(DetectedEnvironment {
-            loader: Loader::Fabric,
-            loader_version: Some(loader_version),
-            minecraft_version,
-        });
-    }
-
-    None
+    latest_environment(
+        detect_fabric_server_jars(root)
+            .into_iter()
+            .chain(detect_dot_fabric_server_jars(root))
+            .chain(detect_fabric_remapped_jars(root))
+            .chain(detect_fabric_library_layout(root)),
+    )
 }
 
 fn detect_quilt(root: &Path) -> Option<DetectedEnvironment> {
@@ -151,11 +140,18 @@ fn detect_quilt(root: &Path) -> Option<DetectedEnvironment> {
             continue;
         }
 
-        let loader_version = entry.path().parent()?.file_name()?.to_string_lossy().to_string();
+        let loader_version = entry
+            .path()
+            .parent()?
+            .file_name()?
+            .to_string_lossy()
+            .to_string();
         let trimmed = file_name
             .trim_end_matches(".jar")
             .trim_start_matches("quilt-loader-");
-        let minecraft_version = trimmed.strip_prefix(&(loader_version.clone() + "-"))?.to_string();
+        let minecraft_version = trimmed
+            .strip_prefix(&(loader_version.clone() + "-"))?
+            .to_string();
         return Some(DetectedEnvironment {
             loader: Loader::Quilt,
             loader_version: Some(loader_version),
@@ -219,8 +215,270 @@ fn detect_neoforge(root: &Path) -> Option<DetectedEnvironment> {
 }
 
 fn looks_like_minecraft_version(value: &str) -> bool {
-    value
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || ch == '.')
+    value.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
         && value.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn detect_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
+    let entries = fs::read_dir(root).ok()?;
+    latest_environment(entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            return None;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let (loader_version, minecraft_version) = parse_root_fabric_server_jar(&file_name)?;
+
+        Some(DetectedEnvironment {
+            loader: Loader::Fabric,
+            loader_version: Some(loader_version),
+            minecraft_version,
+        })
+    }))
+}
+
+fn detect_dot_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
+    let entries = fs::read_dir(root.join(".fabric/server")).ok()?;
+    latest_environment(entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            return None;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let (loader_version, minecraft_version) = parse_dot_fabric_server_jar(&file_name)?;
+
+        Some(DetectedEnvironment {
+            loader: Loader::Fabric,
+            loader_version: Some(loader_version),
+            minecraft_version,
+        })
+    }))
+}
+
+fn detect_fabric_library_layout(root: &Path) -> Option<DetectedEnvironment> {
+    let intermediary_version = detect_fabric_intermediary_version(root);
+
+    latest_environment(
+        WalkDir::new(root.join("libraries/net/fabricmc/fabric-loader"))
+            .max_depth(3)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let parent_version = entry
+                    .path()
+                    .parent()?
+                    .file_name()?
+                    .to_string_lossy()
+                    .to_string();
+                let (loader_version, minecraft_version) =
+                    parse_fabric_loader_library_jar(&file_name, &parent_version)?;
+
+                Some(DetectedEnvironment {
+                    loader: Loader::Fabric,
+                    loader_version: Some(loader_version),
+                    minecraft_version: minecraft_version
+                        .or_else(|| intermediary_version.clone())?,
+                })
+            }),
+    )
+}
+
+fn detect_fabric_remapped_jars(root: &Path) -> Option<DetectedEnvironment> {
+    let entries = fs::read_dir(root.join(".fabric/remappedJars")).ok()?;
+    latest_environment(entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            return None;
+        }
+
+        let folder = entry.file_name().to_string_lossy().to_string();
+        let (minecraft_version, loader_version) = parse_fabric_remapped_jar_dir(&folder)?;
+
+        Some(DetectedEnvironment {
+            loader: Loader::Fabric,
+            loader_version: Some(loader_version),
+            minecraft_version,
+        })
+    }))
+}
+
+fn detect_fabric_intermediary_version(root: &Path) -> Option<String> {
+    let entries = fs::read_dir(root.join("libraries/net/fabricmc/intermediary")).ok()?;
+    latest_version(entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            return None;
+        }
+
+        let version = entry.file_name().to_string_lossy().to_string();
+        looks_like_minecraft_version(&version).then_some(version)
+    }))
+}
+
+fn parse_root_fabric_server_jar(file_name: &str) -> Option<(String, String)> {
+    let trimmed = file_name
+        .strip_prefix("fabric-server-mc.")?
+        .strip_suffix(".jar")?;
+    let (minecraft_version, remainder) = trimmed.split_once("-loader.")?;
+    let (loader_version, _) = remainder.split_once("-launcher.")?;
+    looks_like_minecraft_version(minecraft_version)
+        .then(|| (loader_version.to_string(), minecraft_version.to_string()))
+}
+
+fn parse_dot_fabric_server_jar(file_name: &str) -> Option<(String, String)> {
+    let trimmed = file_name
+        .strip_prefix("fabric-loader-server-")?
+        .strip_suffix(".jar")?;
+    let (loader_version, minecraft_version) = trimmed.split_once("-minecraft-")?;
+    looks_like_minecraft_version(minecraft_version)
+        .then(|| (loader_version.to_string(), minecraft_version.to_string()))
+}
+
+fn parse_fabric_loader_library_jar(
+    file_name: &str,
+    parent_version: &str,
+) -> Option<(String, Option<String>)> {
+    let trimmed = file_name
+        .strip_prefix("fabric-loader-")?
+        .strip_suffix(".jar")?;
+    if !trimmed.starts_with(parent_version) {
+        return None;
+    }
+
+    let minecraft_version = trimmed
+        .strip_prefix(parent_version)
+        .and_then(|remainder| remainder.strip_prefix('-'))
+        .filter(|version| looks_like_minecraft_version(version))
+        .map(str::to_string);
+
+    Some((parent_version.to_string(), minecraft_version))
+}
+
+fn parse_fabric_remapped_jar_dir(folder: &str) -> Option<(String, String)> {
+    let trimmed = folder.strip_prefix("minecraft-")?;
+    let (minecraft_version, loader_version) = trimmed.rsplit_once('-')?;
+    looks_like_minecraft_version(minecraft_version)
+        .then(|| (minecraft_version.to_string(), loader_version.to_string()))
+}
+
+fn detect_launcher_manifest(root: &Path) -> Option<DetectedEnvironment> {
+    root.ancestors()
+        .find_map(|ancestor| detect_mmc_pack_manifest(&ancestor.join("mmc-pack.json")))
+}
+
+fn detect_mmc_pack_manifest(path: &Path) -> Option<DetectedEnvironment> {
+    let manifest = fs::read_to_string(path).ok()?;
+    let manifest: MmcPackManifest = serde_json::from_str(&manifest).ok()?;
+    manifest.detect_environment()
+}
+
+fn latest_environment<I>(candidates: I) -> Option<DetectedEnvironment>
+where
+    I: IntoIterator<Item = DetectedEnvironment>,
+{
+    candidates.into_iter().max_by(compare_detected_environment)
+}
+
+fn latest_version<I>(versions: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    versions
+        .into_iter()
+        .max_by(|left, right| compare_version_strings(left, right))
+}
+
+fn compare_detected_environment(
+    left: &DetectedEnvironment,
+    right: &DetectedEnvironment,
+) -> Ordering {
+    compare_optional_versions(
+        left.loader_version.as_deref(),
+        right.loader_version.as_deref(),
+    )
+    .then_with(|| compare_version_strings(&left.minecraft_version, &right.minecraft_version))
+}
+
+fn compare_optional_versions(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_version_strings(left, right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_version_strings(left: &str, right: &str) -> Ordering {
+    let mut left_parts = left
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty());
+    let mut right_parts = right
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty());
+
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (Some(left), Some(right)) => {
+                let ordering = compare_version_part(left, right);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+fn compare_version_part(left: &str, right: &str) -> Ordering {
+    match (left.parse::<u64>(), right.parse::<u64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MmcPackManifest {
+    #[serde(default)]
+    components: Vec<MmcPackComponent>,
+}
+
+impl MmcPackManifest {
+    fn detect_environment(&self) -> Option<DetectedEnvironment> {
+        let minecraft_version = self.component_version("net.minecraft")?;
+
+        let (loader, loader_version) = [
+            ("net.fabricmc.fabric-loader", Loader::Fabric),
+            ("org.quiltmc.quilt-loader", Loader::Quilt),
+            ("net.minecraftforge", Loader::Forge),
+            ("net.neoforged", Loader::NeoForge),
+            ("net.neoforged.neoforge", Loader::NeoForge),
+        ]
+        .into_iter()
+        .find_map(|(uid, loader)| self.component_version(uid).map(|version| (loader, version)))?;
+
+        Some(DetectedEnvironment {
+            loader,
+            loader_version: Some(loader_version),
+            minecraft_version,
+        })
+    }
+
+    fn component_version(&self, uid: &str) -> Option<String> {
+        self.components
+            .iter()
+            .find(|component| component.uid == uid)
+            .map(|component| component.version.clone())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MmcPackComponent {
+    uid: String,
+    version: String,
 }

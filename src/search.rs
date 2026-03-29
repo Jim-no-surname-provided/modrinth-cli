@@ -42,12 +42,19 @@ pub fn choose_best_match(query: &str, candidates: &[SearchCandidate]) -> Candida
     };
 
     if top_score < 85.0 {
-        return CandidateChoice::Ambiguous(scored.into_iter().take(5).map(|entry| entry.0).collect());
+        return CandidateChoice::Ambiguous(
+            scored.into_iter().take(5).map(|entry| entry.0).collect(),
+        );
     }
 
-    let second_score = scored.get(1).map(|entry| entry.1).unwrap_or(f64::NEG_INFINITY);
+    let second_score = scored
+        .get(1)
+        .map(|entry| entry.1)
+        .unwrap_or(f64::NEG_INFINITY);
     if second_score > 95.0 && (top_score - second_score) < 12.0 {
-        return CandidateChoice::Ambiguous(scored.into_iter().take(5).map(|entry| entry.0).collect());
+        return CandidateChoice::Ambiguous(
+            scored.into_iter().take(5).map(|entry| entry.0).collect(),
+        );
     }
 
     CandidateChoice::Selected(top_candidate)
