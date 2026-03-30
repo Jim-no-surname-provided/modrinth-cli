@@ -76,22 +76,14 @@ impl MinecraftContext {
 fn resolve_root_dir(start: &Path) -> Result<PathBuf> {
     let mut current = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
 
-    if current.file_name().and_then(|name| name.to_str()) == Some("mods") {
-        return Ok(current);
-    }
-
     loop {
-        if current.join("mods").exists() {
-            return Ok(current);
+        if let Some(root) = detect_root_candidate(&current) {
+            return Ok(root);
         }
 
         let Some(parent) = current.parent() else {
             break;
         };
-
-        if parent.file_name().and_then(|name| name.to_str()) == Some("mods") {
-            return Ok(parent.to_path_buf());
-        }
 
         current = parent.to_path_buf();
     }
@@ -100,6 +92,23 @@ fn resolve_root_dir(start: &Path) -> Result<PathBuf> {
         "could not find a Minecraft root or mods directory from {}",
         start.display()
     )
+}
+
+fn detect_root_candidate(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("mods") {
+        return Some(path.to_path_buf());
+    }
+
+    if path.join("mods").is_dir() {
+        return Some(path.to_path_buf());
+    }
+
+    let minecraft_root = path.join("minecraft");
+    if minecraft_root.join("mods").is_dir() {
+        return Some(minecraft_root);
+    }
+
+    None
 }
 
 fn detect_environment(root: &Path) -> Result<DetectedEnvironment> {
@@ -127,91 +136,70 @@ fn detect_fabric(root: &Path) -> Option<DetectedEnvironment> {
 }
 
 fn detect_quilt(root: &Path) -> Option<DetectedEnvironment> {
-    for entry in WalkDir::new(root.join("libraries/org/quiltmc/quilt-loader"))
-        .max_depth(3)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let file_name = entry.file_name().to_string_lossy();
-        if !file_name.starts_with("quilt-loader-") || !file_name.ends_with(".jar") {
-            continue;
-        }
+    latest_environment(
+        WalkDir::new(root.join("libraries/org/quiltmc/quilt-loader"))
+            .max_depth(3)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let loader_version = entry
+                    .path()
+                    .parent()?
+                    .file_name()?
+                    .to_string_lossy()
+                    .to_string();
+                let minecraft_version =
+                    parse_quilt_loader_library_jar(&file_name, &loader_version)?;
 
-        let loader_version = entry
-            .path()
-            .parent()?
-            .file_name()?
-            .to_string_lossy()
-            .to_string();
-        let trimmed = file_name
-            .trim_end_matches(".jar")
-            .trim_start_matches("quilt-loader-");
-        let minecraft_version = trimmed
-            .strip_prefix(&(loader_version.clone() + "-"))?
-            .to_string();
-        return Some(DetectedEnvironment {
-            loader: Loader::Quilt,
-            loader_version: Some(loader_version),
-            minecraft_version,
-        });
-    }
-
-    None
+                Some(DetectedEnvironment {
+                    loader: Loader::Quilt,
+                    loader_version: Some(loader_version),
+                    minecraft_version,
+                })
+            }),
+    )
 }
 
 fn detect_forge(root: &Path) -> Option<DetectedEnvironment> {
-    for entry in WalkDir::new(root.join("libraries/net/minecraftforge/forge"))
-        .max_depth(2)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_dir() {
-            continue;
-        }
+    latest_environment(
+        WalkDir::new(root.join("libraries/net/minecraftforge/forge"))
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_dir())
+            .filter_map(|entry| {
+                let folder = entry.file_name().to_string_lossy().to_string();
+                let (minecraft_version, loader_version) = parse_forge_directory(&folder)?;
 
-        let folder = entry.file_name().to_string_lossy();
-        let (minecraft_version, loader_version) = folder.split_once('-')?;
-        if !looks_like_minecraft_version(minecraft_version) {
-            continue;
-        }
-
-        return Some(DetectedEnvironment {
-            loader: Loader::Forge,
-            loader_version: Some(loader_version.to_string()),
-            minecraft_version: minecraft_version.to_string(),
-        });
-    }
-
-    None
+                Some(DetectedEnvironment {
+                    loader: Loader::Forge,
+                    loader_version: Some(loader_version),
+                    minecraft_version,
+                })
+            }),
+    )
 }
 
 fn detect_neoforge(root: &Path) -> Option<DetectedEnvironment> {
-    for entry in WalkDir::new(root.join("libraries/net/neoforged/neoforge"))
-        .max_depth(2)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_dir() {
-            continue;
-        }
+    latest_environment(
+        WalkDir::new(root.join("libraries/net/neoforged/neoforge"))
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_dir())
+            .filter_map(|entry| {
+                let folder = entry.file_name().to_string_lossy().to_string();
+                let (minecraft_version, loader_version) = parse_neoforge_directory(&folder)?;
 
-        let folder = entry.file_name().to_string_lossy();
-        let (minecraft_version, loader_version) = folder.split_once('-')?;
-        if !looks_like_minecraft_version(minecraft_version) {
-            continue;
-        }
-
-        return Some(DetectedEnvironment {
-            loader: Loader::NeoForge,
-            loader_version: Some(loader_version.to_string()),
-            minecraft_version: minecraft_version.to_string(),
-        });
-    }
-
-    None
+                Some(DetectedEnvironment {
+                    loader: Loader::NeoForge,
+                    loader_version: Some(loader_version),
+                    minecraft_version,
+                })
+            }),
+    )
 }
 
 fn looks_like_minecraft_version(value: &str) -> bool {
@@ -365,6 +353,37 @@ fn parse_fabric_remapped_jar_dir(folder: &str) -> Option<(String, String)> {
         .then(|| (minecraft_version.to_string(), loader_version.to_string()))
 }
 
+fn parse_quilt_loader_library_jar(file_name: &str, loader_version: &str) -> Option<String> {
+    let trimmed = file_name
+        .strip_prefix("quilt-loader-")?
+        .strip_suffix(".jar")?;
+    let minecraft_version = trimmed.strip_prefix(&(loader_version.to_string() + "-"))?;
+    looks_like_minecraft_version(minecraft_version).then(|| minecraft_version.to_string())
+}
+
+fn parse_forge_directory(folder: &str) -> Option<(String, String)> {
+    let (minecraft_version, loader_version) = folder.split_once('-')?;
+    looks_like_minecraft_version(minecraft_version)
+        .then(|| (minecraft_version.to_string(), loader_version.to_string()))
+}
+
+fn parse_neoforge_directory(folder: &str) -> Option<(String, String)> {
+    if let Some((minecraft_version, loader_version)) = folder.split_once('-') {
+        return looks_like_minecraft_version(minecraft_version)
+            .then(|| (minecraft_version.to_string(), loader_version.to_string()));
+    }
+
+    let mut parts = folder.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let _patch = parts.next()?;
+    if major.chars().all(|ch| ch.is_ascii_digit()) && minor.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some((format!("1.{major}.{minor}"), folder.to_string()));
+    }
+
+    None
+}
+
 fn detect_launcher_manifest(root: &Path) -> Option<DetectedEnvironment> {
     root.ancestors()
         .find_map(|ancestor| detect_mmc_pack_manifest(&ancestor.join("mmc-pack.json")))
@@ -396,11 +415,12 @@ fn compare_detected_environment(
     left: &DetectedEnvironment,
     right: &DetectedEnvironment,
 ) -> Ordering {
-    compare_optional_versions(
-        left.loader_version.as_deref(),
-        right.loader_version.as_deref(),
-    )
-    .then_with(|| compare_version_strings(&left.minecraft_version, &right.minecraft_version))
+    compare_version_strings(&left.minecraft_version, &right.minecraft_version).then_with(|| {
+        compare_optional_versions(
+            left.loader_version.as_deref(),
+            right.loader_version.as_deref(),
+        )
+    })
 }
 
 fn compare_optional_versions(left: Option<&str>, right: Option<&str>) -> Ordering {

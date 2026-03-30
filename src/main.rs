@@ -807,6 +807,58 @@ mod tests {
         .unwrap();
     }
 
+    fn write_quilt_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        for loader_version in ["0.27.1", "0.28.0"] {
+            let quilt_dir = root.join(format!(
+                "libraries/org/quiltmc/quilt-loader/{loader_version}"
+            ));
+            fs::create_dir_all(&quilt_dir).unwrap();
+            fs::write(
+                quilt_dir.join(format!("quilt-loader-{loader_version}-1.21.1.jar")),
+                b"loader",
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_forge_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        for version in ["1.21.1-52.0.1", "1.21.1-52.0.2"] {
+            let forge_dir = root.join(format!("libraries/net/minecraftforge/forge/{version}"));
+            fs::create_dir_all(&forge_dir).unwrap();
+        }
+    }
+
+    fn write_neoforge_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        for version in ["20.6.90", "21.1.172"] {
+            let neoforge_dir = root.join(format!("libraries/net/neoforged/neoforge/{version}"));
+            fs::create_dir_all(&neoforge_dir).unwrap();
+        }
+    }
+
+    fn write_mixed_fabric_versions(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        fs::write(
+            root.join("fabric-server-mc.1.21.10-loader.0.18.5-launcher.1.0.0.jar"),
+            b"server",
+        )
+        .unwrap();
+
+        let intermediary_dir = root.join("libraries/net/fabricmc/intermediary/1.21.11");
+        fs::create_dir_all(&intermediary_dir).unwrap();
+        fs::write(
+            intermediary_dir.join("intermediary-1.21.11.jar"),
+            b"intermediary",
+        )
+        .unwrap();
+
+        let fabric_dir = root.join("libraries/net/fabricmc/fabric-loader/0.18.4");
+        fs::create_dir_all(&fabric_dir).unwrap();
+        fs::write(fabric_dir.join("fabric-loader-0.18.4.jar"), b"loader").unwrap();
+    }
+
     #[test]
     fn detects_root_from_mods_directory() {
         let temp = tempdir().unwrap();
@@ -883,6 +935,81 @@ mod tests {
         assert_eq!(
             context.environment.loader_version.as_deref(),
             Some("0.18.5")
+        );
+    }
+
+    #[test]
+    fn detects_prism_launcher_manifest_from_instance_root() {
+        let temp = tempdir().unwrap();
+        let instance_root = temp.path().join("macos boosted beta");
+        write_prism_instance_root(&instance_root);
+
+        let context = MinecraftContext::discover(&instance_root).unwrap();
+        assert_eq!(
+            fs::canonicalize(&context.root_dir).unwrap(),
+            fs::canonicalize(instance_root.join("minecraft")).unwrap()
+        );
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "1.21.11");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.18.5")
+        );
+    }
+
+    #[test]
+    fn detects_quilt_library_layout() {
+        let temp = tempdir().unwrap();
+        write_quilt_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "quilt");
+        assert_eq!(context.environment.minecraft_version, "1.21.1");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.28.0")
+        );
+    }
+
+    #[test]
+    fn detects_forge_library_layout() {
+        let temp = tempdir().unwrap();
+        write_forge_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "forge");
+        assert_eq!(context.environment.minecraft_version, "1.21.1");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("52.0.2")
+        );
+    }
+
+    #[test]
+    fn detects_neoforge_library_layout_without_minecraft_prefix() {
+        let temp = tempdir().unwrap();
+        write_neoforge_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "neoforge");
+        assert_eq!(context.environment.minecraft_version, "1.21.1");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("21.1.172")
+        );
+    }
+
+    #[test]
+    fn prefers_newer_minecraft_version_over_higher_loader_version() {
+        let temp = tempdir().unwrap();
+        write_mixed_fabric_versions(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "1.21.11");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.18.4")
         );
     }
 
