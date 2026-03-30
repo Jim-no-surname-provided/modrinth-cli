@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use minecraft::{DetectedEnvironment, MinecraftContext};
+use minecraft::{DetectedEnvironment, GameVersionIndex, MinecraftContext};
 use modrinth::{ModrinthClient, Project, Version, VersionFile};
 use search::{CandidateChoice, SearchCandidate, choose_best_match};
 use sha1::{Digest, Sha1};
@@ -65,10 +65,13 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir().context("failed to read current working directory")?;
-    let context = MinecraftContext::discover(&cwd)?;
-    print_environment(&context.environment, &context.root_dir, &context.mods_dir);
-
     let client = ModrinthClient::new_from_env()?;
+    let known_game_versions = client
+        .game_versions()
+        .ok()
+        .map(GameVersionIndex::new);
+    let context = MinecraftContext::discover_with_game_versions(&cwd, known_game_versions.as_ref())?;
+    print_environment(&context.environment, &context.root_dir, &context.mods_dir);
 
     match cli.command {
         Command::Install { query } => {

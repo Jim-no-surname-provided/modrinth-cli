@@ -102,6 +102,11 @@ struct LatestVersionsRequest<'a> {
     game_versions: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GameVersionTag {
+    version: String,
+}
+
 impl ModrinthClient {
     pub fn new(base_url: String) -> Result<Self> {
         let http = Client::builder()
@@ -119,6 +124,20 @@ impl ModrinthClient {
         let base_url =
             env::var("MODRINTH_API_BASE").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
         Self::new(base_url)
+    }
+
+    pub fn game_versions(&self) -> Result<Vec<String>> {
+        let tags: Vec<GameVersionTag> = self
+            .http
+            .get(format!("{}/tag/game_version", self.base_url))
+            .send()
+            .context("failed to fetch Modrinth game versions")?
+            .error_for_status()
+            .context("game versions request failed")?
+            .json()
+            .context("failed to decode Modrinth game versions response")?;
+
+        Ok(tags.into_iter().map(|tag| tag.version).collect())
     }
 
     pub fn get_project(&self, id_or_slug: &str) -> Result<Option<Project>> {
@@ -298,5 +317,30 @@ impl VersionFile {
             Some("sources-jar" | "dev-jar" | "javadoc-jar" | "signature")
         );
         not_auxiliary && self.filename.ends_with(".jar")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::Method::GET;
+    use httpmock::MockServer;
+    use serde_json::json;
+
+    #[test]
+    fn fetches_game_versions_from_modrinth_tags() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/tag/game_version");
+            then.status(200).json_body(json!([
+                { "version": "1.21.11" },
+                { "version": "future_version_x" }
+            ]));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let versions = client.game_versions().unwrap();
+
+        assert_eq!(versions, vec!["1.21.11", "future_version_x"]);
     }
 }

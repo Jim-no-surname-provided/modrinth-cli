@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,12 @@ pub enum Loader {
     NeoForge,
 }
 
+#[derive(Debug, Clone)]
+pub struct GameVersionIndex {
+    ranks: HashMap<String, usize>,
+    longest_first: Vec<String>,
+}
+
 impl Loader {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -46,8 +53,66 @@ impl fmt::Display for Loader {
     }
 }
 
+impl GameVersionIndex {
+    pub fn new<I, S>(versions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut ranks = HashMap::new();
+        let mut longest_first = Vec::new();
+
+        for version in versions {
+            let version = version.into();
+            let next_rank = ranks.len();
+            if ranks.insert(version.clone(), next_rank).is_none() {
+                longest_first.push(version);
+            }
+        }
+
+        longest_first.sort_by(|left, right| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left.cmp(right))
+        });
+
+        Self {
+            ranks,
+            longest_first,
+        }
+    }
+
+    fn contains(&self, version: &str) -> bool {
+        self.ranks.contains_key(version)
+    }
+
+    fn rank(&self, version: &str) -> Option<usize> {
+        self.ranks.get(version).copied()
+    }
+
+    fn split_loader_directory(&self, value: &str) -> Option<(String, String)> {
+        self.longest_first.iter().find_map(|version| {
+            value.strip_prefix(version).and_then(|remainder| {
+                remainder
+                    .strip_prefix('-')
+                    .filter(|loader_version| looks_like_loader_version(loader_version))
+                    .map(|loader_version| (version.clone(), loader_version.to_string()))
+            })
+        })
+    }
+}
+
 impl MinecraftContext {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn discover(start: &Path) -> Result<Self> {
+        Self::discover_with_game_versions(start, None)
+    }
+
+    pub fn discover_with_game_versions(
+        start: &Path,
+        known_game_versions: Option<&GameVersionIndex>,
+    ) -> Result<Self> {
         let root_dir = resolve_root_dir(start)?;
         let mods_dir = if root_dir.file_name().and_then(|name| name.to_str()) == Some("mods") {
             root_dir.clone()
@@ -63,7 +128,7 @@ impl MinecraftContext {
             root_dir.clone()
         };
 
-        let environment = detect_environment(&effective_root)?;
+        let environment = detect_environment(&effective_root, known_game_versions)?;
 
         Ok(Self {
             root_dir: effective_root,
@@ -111,12 +176,15 @@ fn detect_root_candidate(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn detect_environment(root: &Path) -> Result<DetectedEnvironment> {
+fn detect_environment(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Result<DetectedEnvironment> {
     detect_launcher_manifest(root)
-        .or_else(|| detect_fabric(root))
-        .or_else(|| detect_quilt(root))
-        .or_else(|| detect_forge(root))
-        .or_else(|| detect_neoforge(root))
+        .or_else(|| detect_fabric(root, known_game_versions))
+        .or_else(|| detect_quilt(root, known_game_versions))
+        .or_else(|| detect_forge(root, known_game_versions))
+        .or_else(|| detect_neoforge(root, known_game_versions))
         .with_context(|| {
             format!(
                 "failed to detect loader and Minecraft version from {}",
@@ -125,17 +193,18 @@ fn detect_environment(root: &Path) -> Result<DetectedEnvironment> {
         })
 }
 
-fn detect_fabric(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_fabric(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
     latest_environment(
-        detect_fabric_server_jars(root)
+        detect_fabric_server_jars(root, known_game_versions)
             .into_iter()
-            .chain(detect_dot_fabric_server_jars(root))
-            .chain(detect_fabric_remapped_jars(root))
-            .chain(detect_fabric_library_layout(root)),
+            .chain(detect_dot_fabric_server_jars(root, known_game_versions))
+            .chain(detect_fabric_remapped_jars(root, known_game_versions))
+            .chain(detect_fabric_library_layout(root, known_game_versions)),
+        known_game_versions,
     )
 }
 
-fn detect_quilt(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_quilt(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
     latest_environment(
         WalkDir::new(root.join("libraries/org/quiltmc/quilt-loader"))
             .max_depth(3)
@@ -151,7 +220,7 @@ fn detect_quilt(root: &Path) -> Option<DetectedEnvironment> {
                     .to_string_lossy()
                     .to_string();
                 let minecraft_version =
-                    parse_quilt_loader_library_jar(&file_name, &loader_version)?;
+                    parse_quilt_loader_library_jar(&file_name, &loader_version, known_game_versions)?;
 
                 Some(DetectedEnvironment {
                     loader: Loader::Quilt,
@@ -159,10 +228,11 @@ fn detect_quilt(root: &Path) -> Option<DetectedEnvironment> {
                     minecraft_version,
                 })
             }),
+        known_game_versions,
     )
 }
 
-fn detect_forge(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_forge(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
     latest_environment(
         WalkDir::new(root.join("libraries/net/minecraftforge/forge"))
             .max_depth(2)
@@ -171,7 +241,8 @@ fn detect_forge(root: &Path) -> Option<DetectedEnvironment> {
             .filter(|entry| entry.file_type().is_dir())
             .filter_map(|entry| {
                 let folder = entry.file_name().to_string_lossy().to_string();
-                let (minecraft_version, loader_version) = parse_forge_directory(&folder)?;
+                let (minecraft_version, loader_version) =
+                    parse_forge_directory(&folder, known_game_versions)?;
 
                 Some(DetectedEnvironment {
                     loader: Loader::Forge,
@@ -179,10 +250,11 @@ fn detect_forge(root: &Path) -> Option<DetectedEnvironment> {
                     minecraft_version,
                 })
             }),
+        known_game_versions,
     )
 }
 
-fn detect_neoforge(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_neoforge(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
     latest_environment(
         WalkDir::new(root.join("libraries/net/neoforged/neoforge"))
             .max_depth(2)
@@ -191,7 +263,8 @@ fn detect_neoforge(root: &Path) -> Option<DetectedEnvironment> {
             .filter(|entry| entry.file_type().is_dir())
             .filter_map(|entry| {
                 let folder = entry.file_name().to_string_lossy().to_string();
-                let (minecraft_version, loader_version) = parse_neoforge_directory(&folder)?;
+                let (minecraft_version, loader_version) =
+                    parse_neoforge_directory(&folder, known_game_versions)?;
 
                 Some(DetectedEnvironment {
                     loader: Loader::NeoForge,
@@ -199,6 +272,7 @@ fn detect_neoforge(root: &Path) -> Option<DetectedEnvironment> {
                     minecraft_version,
                 })
             }),
+        known_game_versions,
     )
 }
 
@@ -254,6 +328,13 @@ fn looks_like_minecraft_version(value: &str) -> bool {
                 && suffix.starts_with("Pre")
                 && suffix[3..].chars().all(|ch| ch.is_ascii_digit())
     )
+}
+
+fn supports_minecraft_version(
+    value: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> bool {
+    known_game_versions.is_some_and(|index| index.contains(value)) || looks_like_minecraft_version(value)
 }
 
 fn looks_like_numeric_dotted_value(value: &str) -> bool {
@@ -319,7 +400,10 @@ fn looks_like_loader_version(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+'))
 }
 
-fn detect_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_fabric_server_jars(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     let entries = fs::read_dir(root).ok()?;
     latest_environment(entries.filter_map(|entry| {
         let entry = entry.ok()?;
@@ -329,16 +413,22 @@ fn detect_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
 
         let file_name = entry.file_name().to_string_lossy().to_string();
         let (loader_version, minecraft_version) = parse_root_fabric_server_jar(&file_name)?;
+        if !supports_minecraft_version(&minecraft_version, known_game_versions) {
+            return None;
+        }
 
         Some(DetectedEnvironment {
             loader: Loader::Fabric,
             loader_version: Some(loader_version),
             minecraft_version,
         })
-    }))
+    }), known_game_versions)
 }
 
-fn detect_dot_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_dot_fabric_server_jars(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     let entries = fs::read_dir(root.join(".fabric/server")).ok()?;
     latest_environment(entries.filter_map(|entry| {
         let entry = entry.ok()?;
@@ -348,17 +438,23 @@ fn detect_dot_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
 
         let file_name = entry.file_name().to_string_lossy().to_string();
         let (loader_version, minecraft_version) = parse_dot_fabric_server_jar(&file_name)?;
+        if !supports_minecraft_version(&minecraft_version, known_game_versions) {
+            return None;
+        }
 
         Some(DetectedEnvironment {
             loader: Loader::Fabric,
             loader_version: Some(loader_version),
             minecraft_version,
         })
-    }))
+    }), known_game_versions)
 }
 
-fn detect_fabric_library_layout(root: &Path) -> Option<DetectedEnvironment> {
-    let intermediary_version = detect_fabric_intermediary_version(root);
+fn detect_fabric_library_layout(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
+    let intermediary_version = detect_fabric_intermediary_version(root, known_game_versions);
 
     latest_environment(
         WalkDir::new(root.join("libraries/net/fabricmc/fabric-loader"))
@@ -375,7 +471,11 @@ fn detect_fabric_library_layout(root: &Path) -> Option<DetectedEnvironment> {
                     .to_string_lossy()
                     .to_string();
                 let (loader_version, minecraft_version) =
-                    parse_fabric_loader_library_jar(&file_name, &parent_version)?;
+                    parse_fabric_loader_library_jar(
+                        &file_name,
+                        &parent_version,
+                        known_game_versions,
+                    )?;
 
                 Some(DetectedEnvironment {
                     loader: Loader::Fabric,
@@ -384,10 +484,14 @@ fn detect_fabric_library_layout(root: &Path) -> Option<DetectedEnvironment> {
                         .or_else(|| intermediary_version.clone())?,
                 })
             }),
+        known_game_versions,
     )
 }
 
-fn detect_fabric_remapped_jars(root: &Path) -> Option<DetectedEnvironment> {
+fn detect_fabric_remapped_jars(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     let entries = fs::read_dir(root.join(".fabric/remappedJars")).ok()?;
     latest_environment(entries.filter_map(|entry| {
         let entry = entry.ok()?;
@@ -397,16 +501,22 @@ fn detect_fabric_remapped_jars(root: &Path) -> Option<DetectedEnvironment> {
 
         let folder = entry.file_name().to_string_lossy().to_string();
         let (minecraft_version, loader_version) = parse_fabric_remapped_jar_dir(&folder)?;
+        if !supports_minecraft_version(&minecraft_version, known_game_versions) {
+            return None;
+        }
 
         Some(DetectedEnvironment {
             loader: Loader::Fabric,
             loader_version: Some(loader_version),
             minecraft_version,
         })
-    }))
+    }), known_game_versions)
 }
 
-fn detect_fabric_intermediary_version(root: &Path) -> Option<String> {
+fn detect_fabric_intermediary_version(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<String> {
     let entries = fs::read_dir(root.join("libraries/net/fabricmc/intermediary")).ok()?;
     latest_version(entries.filter_map(|entry| {
         let entry = entry.ok()?;
@@ -415,8 +525,8 @@ fn detect_fabric_intermediary_version(root: &Path) -> Option<String> {
         }
 
         let version = entry.file_name().to_string_lossy().to_string();
-        looks_like_minecraft_version(&version).then_some(version)
-    }))
+        supports_minecraft_version(&version, known_game_versions).then_some(version)
+    }), known_game_versions)
 }
 
 fn parse_root_fabric_server_jar(file_name: &str) -> Option<(String, String)> {
@@ -441,6 +551,7 @@ fn parse_dot_fabric_server_jar(file_name: &str) -> Option<(String, String)> {
 fn parse_fabric_loader_library_jar(
     file_name: &str,
     parent_version: &str,
+    known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<(String, Option<String>)> {
     let trimmed = file_name
         .strip_prefix("fabric-loader-")?
@@ -452,7 +563,7 @@ fn parse_fabric_loader_library_jar(
     let minecraft_version = trimmed
         .strip_prefix(parent_version)
         .and_then(|remainder| remainder.strip_prefix('-'))
-        .filter(|version| looks_like_minecraft_version(version))
+        .filter(|version| supports_minecraft_version(version, known_game_versions))
         .map(str::to_string);
 
     Some((parent_version.to_string(), minecraft_version))
@@ -465,28 +576,50 @@ fn parse_fabric_remapped_jar_dir(folder: &str) -> Option<(String, String)> {
         .then(|| (minecraft_version.to_string(), loader_version.to_string()))
 }
 
-fn parse_quilt_loader_library_jar(file_name: &str, loader_version: &str) -> Option<String> {
+fn parse_quilt_loader_library_jar(
+    file_name: &str,
+    loader_version: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<String> {
     let trimmed = file_name
         .strip_prefix("quilt-loader-")?
         .strip_suffix(".jar")?;
     let minecraft_version = trimmed.strip_prefix(&(loader_version.to_string() + "-"))?;
-    looks_like_minecraft_version(minecraft_version).then(|| minecraft_version.to_string())
+    supports_minecraft_version(minecraft_version, known_game_versions)
+        .then(|| minecraft_version.to_string())
 }
 
-fn parse_forge_directory(folder: &str) -> Option<(String, String)> {
-    split_loader_directory_version(folder)
+fn parse_forge_directory(
+    folder: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<(String, String)> {
+    split_loader_directory_version(folder, known_game_versions)
 }
 
-fn parse_neoforge_directory(folder: &str) -> Option<(String, String)> {
-    split_loader_directory_version(folder).or_else(|| parse_neoforge_loader_only_version(folder))
+fn parse_neoforge_directory(
+    folder: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<(String, String)> {
+    split_loader_directory_version(folder, known_game_versions)
+        .or_else(|| parse_neoforge_loader_only_version(folder))
 }
 
-fn split_loader_directory_version(folder: &str) -> Option<(String, String)> {
+fn split_loader_directory_version(
+    folder: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<(String, String)> {
+    if let Some(known_versions) = known_game_versions {
+        if let Some(split) = known_versions.split_loader_directory(folder) {
+            return Some(split);
+        }
+    }
+
     folder.match_indices('-').rev().find_map(|(index, _)| {
         let minecraft_version = &folder[..index];
         let loader_version = &folder[index + 1..];
-        (looks_like_minecraft_version(minecraft_version) && looks_like_loader_version(loader_version))
-            .then(|| (minecraft_version.to_string(), loader_version.to_string()))
+        (supports_minecraft_version(minecraft_version, known_game_versions)
+            && looks_like_loader_version(loader_version))
+        .then(|| (minecraft_version.to_string(), loader_version.to_string()))
     })
 }
 
@@ -514,32 +647,66 @@ fn detect_mmc_pack_manifest(path: &Path) -> Option<DetectedEnvironment> {
     manifest.detect_environment()
 }
 
-fn latest_environment<I>(candidates: I) -> Option<DetectedEnvironment>
+fn latest_environment<I>(
+    candidates: I,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment>
 where
     I: IntoIterator<Item = DetectedEnvironment>,
 {
-    candidates.into_iter().max_by(compare_detected_environment)
+    candidates
+        .into_iter()
+        .max_by(|left, right| compare_detected_environment(left, right, known_game_versions))
 }
 
-fn latest_version<I>(versions: I) -> Option<String>
+fn latest_version<I>(versions: I, known_game_versions: Option<&GameVersionIndex>) -> Option<String>
 where
     I: IntoIterator<Item = String>,
 {
     versions
         .into_iter()
-        .max_by(|left, right| compare_version_strings(left, right))
+        .max_by(|left, right| compare_minecraft_versions(left, right, known_game_versions))
 }
 
 fn compare_detected_environment(
     left: &DetectedEnvironment,
     right: &DetectedEnvironment,
+    known_game_versions: Option<&GameVersionIndex>,
 ) -> Ordering {
-    compare_version_strings(&left.minecraft_version, &right.minecraft_version).then_with(|| {
+    compare_minecraft_versions(
+        &left.minecraft_version,
+        &right.minecraft_version,
+        known_game_versions,
+    )
+    .then_with(|| {
         compare_optional_versions(
             left.loader_version.as_deref(),
             right.loader_version.as_deref(),
         )
     })
+}
+
+fn compare_minecraft_versions(
+    left: &str,
+    right: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Ordering {
+    if let Some(ordering) = compare_known_game_version_rank(left, right, known_game_versions) {
+        return ordering;
+    }
+
+    compare_version_strings(left, right)
+}
+
+fn compare_known_game_version_rank(
+    left: &str,
+    right: &str,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<Ordering> {
+    let known_game_versions = known_game_versions?;
+    let left_rank = known_game_versions.rank(left)?;
+    let right_rank = known_game_versions.rank(right)?;
+    Some(right_rank.cmp(&left_rank))
 }
 
 fn compare_optional_versions(left: Option<&str>, right: Option<&str>) -> Ordering {
@@ -741,19 +908,19 @@ mod tests {
     #[test]
     fn splits_hyphenated_loader_directories_on_the_right_boundary() {
         assert_eq!(
-            split_loader_directory_version("1.20.5-pre1-49.0.38"),
+            split_loader_directory_version("1.20.5-pre1-49.0.38", None),
             Some(("1.20.5-pre1".to_string(), "49.0.38".to_string()))
         );
         assert_eq!(
-            split_loader_directory_version("26.1-snapshot-11-54.0.1"),
+            split_loader_directory_version("26.1-snapshot-11-54.0.1", None),
             Some(("26.1-snapshot-11".to_string(), "54.0.1".to_string()))
         );
         assert_eq!(
-            split_loader_directory_version("inf-20100618-1.0.0"),
+            split_loader_directory_version("inf-20100618-1.0.0", None),
             Some(("inf-20100618".to_string(), "1.0.0".to_string()))
         );
         assert_eq!(
-            split_loader_directory_version("1.7.10-10.13.4.1614-1.7.10"),
+            split_loader_directory_version("1.7.10-10.13.4.1614-1.7.10", None),
             Some((
                 "1.7.10".to_string(),
                 "10.13.4.1614-1.7.10".to_string()
@@ -764,12 +931,27 @@ mod tests {
     #[test]
     fn infers_neoforge_versions_from_loader_only_folders_with_suffixes() {
         assert_eq!(
-            parse_neoforge_directory("20.6.90-beta"),
+            parse_neoforge_directory("20.6.90-beta", None),
             Some(("1.20.6".to_string(), "20.6.90-beta".to_string()))
         );
         assert_eq!(
-            parse_neoforge_directory("1.20.6-20.6.90-beta"),
+            parse_neoforge_directory("1.20.6-20.6.90-beta", None),
             Some(("1.20.6".to_string(), "20.6.90-beta".to_string()))
+        );
+    }
+
+    #[test]
+    fn accepts_dynamic_modrinth_versions_outside_builtin_heuristics() {
+        let known_versions = GameVersionIndex::new(["future_version_x"]);
+
+        assert!(!looks_like_minecraft_version("future_version_x"));
+        assert!(supports_minecraft_version(
+            "future_version_x",
+            Some(&known_versions)
+        ));
+        assert_eq!(
+            split_loader_directory_version("future_version_x-99.0.0", Some(&known_versions)),
+            Some(("future_version_x".to_string(), "99.0.0".to_string()))
         );
     }
 
