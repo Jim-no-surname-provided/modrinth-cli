@@ -203,8 +203,120 @@ fn detect_neoforge(root: &Path) -> Option<DetectedEnvironment> {
 }
 
 fn looks_like_minecraft_version(value: &str) -> bool {
-    value.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return false;
+    }
+
+    if value
+        .strip_prefix("rd-")
+        .or_else(|| value.strip_prefix("inf-"))
+        .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return true;
+    }
+
+    if let Some(snapshot) = value.strip_prefix("3D-Shareware-v") {
+        return looks_like_numeric_dotted_value(snapshot);
+    }
+
+    if looks_like_weekly_snapshot(value) || looks_like_classic_prefixed_version(value) {
+        return true;
+    }
+
+    let parts: Vec<&str> = value.split('-').collect();
+    let Some(base) = parts.first().copied() else {
+        return false;
+    };
+
+    if parts.len() == 1 {
+        return looks_like_numeric_dotted_value(base);
+    }
+
+    if looks_like_numeric_dotted_value(base) {
+        return match parts.as_slice() {
+            [_, suffix] => is_compact_prerelease_suffix(suffix) || is_named_version_suffix(suffix),
+            [_, channel, number] => {
+                is_split_prerelease_channel(channel)
+                    && number.chars().all(|ch| ch.is_ascii_digit())
+            }
+            _ => false,
+        };
+    }
+
+    matches!(
+        parts.as_slice(),
+        [base, suffix]
+            if looks_like_alphanumeric_dotted_value(base)
+                && suffix.starts_with("Pre")
+                && suffix[3..].chars().all(|ch| ch.is_ascii_digit())
+    )
+}
+
+fn looks_like_numeric_dotted_value(value: &str) -> bool {
+    value
+        .split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn looks_like_alphanumeric_dotted_value(value: &str) -> bool {
+    value
+        .split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
         && value.chars().any(|ch| ch.is_ascii_digit())
+        && value.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn looks_like_weekly_snapshot(value: &str) -> bool {
+    let Some((year, rest)) = value.split_once('w') else {
+        return false;
+    };
+
+    year.chars().all(|ch| ch.is_ascii_digit())
+        && !year.is_empty()
+        && rest.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && rest.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && rest.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn looks_like_classic_prefixed_version(value: &str) -> bool {
+    let (prefix, rest) = value.split_at(1);
+
+    matches!(prefix, "a" | "b" | "c")
+        && !rest.is_empty()
+        && rest.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_'))
+        && rest.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn is_compact_prerelease_suffix(value: &str) -> bool {
+    ["pre", "rc"]
+        .into_iter()
+        .any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+        })
+}
+
+fn is_named_version_suffix(value: &str) -> bool {
+    matches!(
+        value,
+        "potato" | "combat" | "experimental" | "snapshot" | "shareware"
+    )
+}
+
+fn is_split_prerelease_channel(value: &str) -> bool {
+    matches!(value, "pre" | "rc" | "snapshot")
+}
+
+fn looks_like_loader_version(value: &str) -> bool {
+    value.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+'))
 }
 
 fn detect_fabric_server_jars(root: &Path) -> Option<DetectedEnvironment> {
@@ -362,21 +474,28 @@ fn parse_quilt_loader_library_jar(file_name: &str, loader_version: &str) -> Opti
 }
 
 fn parse_forge_directory(folder: &str) -> Option<(String, String)> {
-    let (minecraft_version, loader_version) = folder.split_once('-')?;
-    looks_like_minecraft_version(minecraft_version)
-        .then(|| (minecraft_version.to_string(), loader_version.to_string()))
+    split_loader_directory_version(folder)
 }
 
 fn parse_neoforge_directory(folder: &str) -> Option<(String, String)> {
-    if let Some((minecraft_version, loader_version)) = folder.split_once('-') {
-        return looks_like_minecraft_version(minecraft_version)
-            .then(|| (minecraft_version.to_string(), loader_version.to_string()));
-    }
+    split_loader_directory_version(folder).or_else(|| parse_neoforge_loader_only_version(folder))
+}
 
-    let mut parts = folder.split('.');
+fn split_loader_directory_version(folder: &str) -> Option<(String, String)> {
+    folder.match_indices('-').rev().find_map(|(index, _)| {
+        let minecraft_version = &folder[..index];
+        let loader_version = &folder[index + 1..];
+        (looks_like_minecraft_version(minecraft_version) && looks_like_loader_version(loader_version))
+            .then(|| (minecraft_version.to_string(), loader_version.to_string()))
+    })
+}
+
+fn parse_neoforge_loader_only_version(folder: &str) -> Option<(String, String)> {
+    let mut parts = folder.split(['.', '-']);
     let major = parts.next()?;
     let minor = parts.next()?;
     let _patch = parts.next()?;
+
     if major.chars().all(|ch| ch.is_ascii_digit()) && minor.chars().all(|ch| ch.is_ascii_digit()) {
         return Some((format!("1.{major}.{minor}"), folder.to_string()));
     }
@@ -433,32 +552,120 @@ fn compare_optional_versions(left: Option<&str>, right: Option<&str>) -> Orderin
 }
 
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
-    let mut left_parts = left
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty());
-    let mut right_parts = right
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty());
+    let left_parts = tokenize_version_string(left);
+    let right_parts = tokenize_version_string(right);
+    let max_len = left_parts.len().max(right_parts.len());
 
-    loop {
-        match (left_parts.next(), right_parts.next()) {
+    for index in 0..max_len {
+        match (left_parts.get(index), right_parts.get(index)) {
             (Some(left), Some(right)) => {
                 let ordering = compare_version_part(left, right);
                 if ordering != Ordering::Equal {
                     return ordering;
                 }
             }
-            (Some(_), None) => return Ordering::Greater,
-            (None, Some(_)) => return Ordering::Less,
-            (None, None) => return Ordering::Equal,
+            (Some(extra), None) => {
+                return if extra.is_prerelease_marker() {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            (None, Some(extra)) => {
+                return if extra.is_prerelease_marker() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            (None, None) => break,
         }
+    }
+
+    Ordering::Equal
+}
+
+fn tokenize_version_string(value: &str) -> Vec<VersionPart<'_>> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut current_is_digit = false;
+
+    for (index, ch) in value.char_indices() {
+        if !ch.is_ascii_alphanumeric() {
+            if let Some(token_start) = start.take() {
+                parts.push(VersionPart::from(&value[token_start..index]));
+            }
+            continue;
+        }
+
+        let is_digit = ch.is_ascii_digit();
+        match start {
+            None => {
+                start = Some(index);
+                current_is_digit = is_digit;
+            }
+            Some(token_start) if current_is_digit != is_digit => {
+                parts.push(VersionPart::from(&value[token_start..index]));
+                start = Some(index);
+                current_is_digit = is_digit;
+            }
+            Some(_) => {}
+        }
+    }
+
+    if let Some(token_start) = start {
+        parts.push(VersionPart::from(&value[token_start..]));
+    }
+
+    parts
+}
+
+fn compare_version_part(left: &VersionPart<'_>, right: &VersionPart<'_>) -> Ordering {
+    match (left, right) {
+        (VersionPart::Number(left), VersionPart::Number(right)) => left.cmp(right),
+        (VersionPart::Text(left), VersionPart::Text(right)) => compare_text_version_part(left, right),
+        (VersionPart::Number(_), VersionPart::Text(_)) => Ordering::Greater,
+        (VersionPart::Text(_), VersionPart::Number(_)) => Ordering::Less,
     }
 }
 
-fn compare_version_part(left: &str, right: &str) -> Ordering {
-    match (left.parse::<u64>(), right.parse::<u64>()) {
-        (Ok(left), Ok(right)) => left.cmp(&right),
-        _ => left.cmp(right),
+fn compare_text_version_part(left: &str, right: &str) -> Ordering {
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+
+    match (release_channel_rank(&left), release_channel_rank(&right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(&right),
+    }
+}
+
+fn release_channel_rank(value: &str) -> Option<u8> {
+    match value {
+        "snapshot" => Some(0),
+        "pre" => Some(1),
+        "rc" => Some(2),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionPart<'a> {
+    Number(u64),
+    Text(&'a str),
+}
+
+impl<'a> VersionPart<'a> {
+    fn from(value: &'a str) -> Self {
+        match value.parse::<u64>() {
+            Ok(number) => Self::Number(number),
+            Err(_) => Self::Text(value),
+        }
+    }
+
+    fn is_prerelease_marker(&self) -> bool {
+        matches!(self, Self::Text(value) if release_channel_rank(&value.to_ascii_lowercase()).is_some())
     }
 }
 
@@ -501,4 +708,88 @@ impl MmcPackManifest {
 struct MmcPackComponent {
     uid: String,
     version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_modrinth_game_version_families() {
+        for version in [
+            "1.21.11",
+            "1.21-pre1",
+            "1.21.11-pre5",
+            "1.20.6-rc1",
+            "26.1-pre-3",
+            "26.1-rc-3",
+            "26.1-snapshot-11",
+            "25w46a",
+            "24w14potato",
+            "3D-Shareware-v1.34",
+            "1.RV-Pre1",
+            "b1.7.3",
+            "a1.2.6",
+            "c0.30_01c",
+            "inf-20100618",
+            "rd-161348",
+        ] {
+            assert!(looks_like_minecraft_version(version), "{version} should be accepted");
+        }
+    }
+
+    #[test]
+    fn splits_hyphenated_loader_directories_on_the_right_boundary() {
+        assert_eq!(
+            split_loader_directory_version("1.20.5-pre1-49.0.38"),
+            Some(("1.20.5-pre1".to_string(), "49.0.38".to_string()))
+        );
+        assert_eq!(
+            split_loader_directory_version("26.1-snapshot-11-54.0.1"),
+            Some(("26.1-snapshot-11".to_string(), "54.0.1".to_string()))
+        );
+        assert_eq!(
+            split_loader_directory_version("inf-20100618-1.0.0"),
+            Some(("inf-20100618".to_string(), "1.0.0".to_string()))
+        );
+        assert_eq!(
+            split_loader_directory_version("1.7.10-10.13.4.1614-1.7.10"),
+            Some((
+                "1.7.10".to_string(),
+                "10.13.4.1614-1.7.10".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn infers_neoforge_versions_from_loader_only_folders_with_suffixes() {
+        assert_eq!(
+            parse_neoforge_directory("20.6.90-beta"),
+            Some(("1.20.6".to_string(), "20.6.90-beta".to_string()))
+        );
+        assert_eq!(
+            parse_neoforge_directory("1.20.6-20.6.90-beta"),
+            Some(("1.20.6".to_string(), "20.6.90-beta".to_string()))
+        );
+    }
+
+    #[test]
+    fn compares_snapshots_and_prereleases_naturally() {
+        assert_eq!(
+            compare_version_strings("25w09a", "25w10a"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_version_strings("1.21.11-pre5", "1.21.11-pre12"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_version_strings("1.21.11-rc1", "1.21.11"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_version_strings("26.1-snapshot-11", "26.1-pre-1"),
+            Ordering::Less
+        );
+    }
 }

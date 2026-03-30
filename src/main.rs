@@ -830,12 +830,33 @@ mod tests {
         }
     }
 
+    fn write_forge_prerelease_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        let forge_dir = root.join("libraries/net/minecraftforge/forge/1.20.5-pre1-49.0.38");
+        fs::create_dir_all(&forge_dir).unwrap();
+    }
+
     fn write_neoforge_root(root: &Path) {
         fs::create_dir_all(root.join("mods")).unwrap();
         for version in ["20.6.90", "21.1.172"] {
             let neoforge_dir = root.join(format!("libraries/net/neoforged/neoforge/{version}"));
             fs::create_dir_all(&neoforge_dir).unwrap();
         }
+    }
+
+    fn write_neoforge_loader_only_prerelease_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        let neoforge_dir = root.join("libraries/net/neoforged/neoforge/20.6.90-beta");
+        fs::create_dir_all(&neoforge_dir).unwrap();
+    }
+
+    fn write_snapshot_fabric_root(root: &Path) {
+        fs::create_dir_all(root.join("mods")).unwrap();
+        fs::write(
+            root.join("fabric-server-mc.24w14potato-loader.0.15.11-launcher.1.0.0.jar"),
+            b"server",
+        )
+        .unwrap();
     }
 
     fn write_mixed_fabric_versions(root: &Path) {
@@ -924,6 +945,20 @@ mod tests {
     }
 
     #[test]
+    fn detects_snapshot_fabric_versions_supported_by_modrinth() {
+        let temp = tempdir().unwrap();
+        write_snapshot_fabric_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "fabric");
+        assert_eq!(context.environment.minecraft_version, "24w14potato");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("0.15.11")
+        );
+    }
+
+    #[test]
     fn detects_prism_launcher_manifest_from_instance_parent() {
         let temp = tempdir().unwrap();
         let instance_root = temp.path().join("macos boosted beta");
@@ -986,6 +1021,20 @@ mod tests {
     }
 
     #[test]
+    fn detects_forge_prerelease_minecraft_versions() {
+        let temp = tempdir().unwrap();
+        write_forge_prerelease_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "forge");
+        assert_eq!(context.environment.minecraft_version, "1.20.5-pre1");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("49.0.38")
+        );
+    }
+
+    #[test]
     fn detects_neoforge_library_layout_without_minecraft_prefix() {
         let temp = tempdir().unwrap();
         write_neoforge_root(temp.path());
@@ -996,6 +1045,20 @@ mod tests {
         assert_eq!(
             context.environment.loader_version.as_deref(),
             Some("21.1.172")
+        );
+    }
+
+    #[test]
+    fn detects_neoforge_loader_only_prerelease_versions() {
+        let temp = tempdir().unwrap();
+        write_neoforge_loader_only_prerelease_root(temp.path());
+
+        let context = MinecraftContext::discover(&temp.path().join("mods")).unwrap();
+        assert_eq!(context.environment.loader.as_str(), "neoforge");
+        assert_eq!(context.environment.minecraft_version, "1.20.6");
+        assert_eq!(
+            context.environment.loader_version.as_deref(),
+            Some("20.6.90-beta")
         );
     }
 
