@@ -164,13 +164,15 @@ impl ModrinthClient {
     pub fn search_projects(
         &self,
         query: &str,
-        environment: &DetectedEnvironment,
+        environment: Option<&DetectedEnvironment>,
     ) -> Result<Vec<SearchHit>> {
-        let facets = serde_json::to_string(&vec![
-            vec!["project_type:mod".to_string()],
-            vec![format!("categories:{}", environment.loader.as_str())],
-            vec![format!("versions:{}", environment.minecraft_version)],
-        ])?;
+        let mut facets = vec![vec!["project_type:mod".to_string()]];
+        if let Some(environment) = environment {
+            facets.push(vec![format!("categories:{}", environment.loader.as_str())]);
+            facets.push(vec![format!("versions:{}", environment.minecraft_version)]);
+        }
+
+        let facets = serde_json::to_string(&facets)?;
         let url = format!(
             "{}/search?query={}&limit=20&index=relevance&facets={}",
             self.base_url,
@@ -323,6 +325,7 @@ impl VersionFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::minecraft::{DetectedEnvironment, Loader};
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use serde_json::json;
@@ -342,5 +345,82 @@ mod tests {
         let versions = client.game_versions().unwrap();
 
         assert_eq!(versions, vec!["1.21.11", "future_version_x"]);
+    }
+
+    #[test]
+    fn search_projects_includes_environment_facets_when_present() {
+        let server = MockServer::start();
+        let expected_facets = serde_json::to_string(&vec![
+            vec!["project_type:mod".to_string()],
+            vec!["categories:fabric".to_string()],
+            vec!["versions:1.21.1".to_string()],
+        ])
+        .unwrap();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/search")
+                .query_param("query", "sodium")
+                .query_param("limit", "20")
+                .query_param("index", "relevance")
+                .query_param("facets", &expected_facets);
+            then.status(200).json_body(json!({
+                "hits": [
+                    {
+                        "project_id": "proj1",
+                        "slug": "sodium",
+                        "title": "Sodium",
+                        "downloads": 100000
+                    }
+                ]
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let environment = DetectedEnvironment {
+            loader: Loader::Fabric,
+            loader_version: Some("0.16.10".to_string()),
+            minecraft_version: "1.21.1".to_string(),
+        };
+
+        let hits = client
+            .search_projects("sodium", Some(&environment))
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "sodium");
+    }
+
+    #[test]
+    fn search_projects_omits_loader_and_version_facets_for_global_search() {
+        let server = MockServer::start();
+        let expected_facets =
+            serde_json::to_string(&vec![vec!["project_type:mod".to_string()]]).unwrap();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/search").is_true(move |req| {
+                let params = req.query_params_map();
+                params.get("query") == Some(&"sodium".to_string())
+                    && params.get("limit") == Some(&"20".to_string())
+                    && params.get("index") == Some(&"relevance".to_string())
+                    && params.get("facets") == Some(&expected_facets)
+            });
+            then.status(200).json_body(json!({
+                "hits": [
+                    {
+                        "project_id": "proj1",
+                        "slug": "sodium",
+                        "title": "Sodium",
+                        "downloads": 100000
+                    }
+                ]
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let hits = client.search_projects("sodium", None).unwrap();
+
+        mock.assert();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "sodium");
     }
 }

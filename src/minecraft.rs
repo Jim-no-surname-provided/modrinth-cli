@@ -70,12 +70,8 @@ impl GameVersionIndex {
             }
         }
 
-        longest_first.sort_by(|left, right| {
-            right
-                .len()
-                .cmp(&left.len())
-                .then_with(|| left.cmp(right))
-        });
+        longest_first
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
 
         Self {
             ranks,
@@ -193,7 +189,10 @@ fn detect_environment(
         })
 }
 
-fn detect_fabric(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
+fn detect_fabric(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     latest_environment(
         detect_fabric_server_jars(root, known_game_versions)
             .into_iter()
@@ -204,7 +203,10 @@ fn detect_fabric(root: &Path, known_game_versions: Option<&GameVersionIndex>) ->
     )
 }
 
-fn detect_quilt(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
+fn detect_quilt(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     latest_environment(
         WalkDir::new(root.join("libraries/org/quiltmc/quilt-loader"))
             .max_depth(3)
@@ -219,8 +221,11 @@ fn detect_quilt(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> 
                     .file_name()?
                     .to_string_lossy()
                     .to_string();
-                let minecraft_version =
-                    parse_quilt_loader_library_jar(&file_name, &loader_version, known_game_versions)?;
+                let minecraft_version = parse_quilt_loader_library_jar(
+                    &file_name,
+                    &loader_version,
+                    known_game_versions,
+                )?;
 
                 Some(DetectedEnvironment {
                     loader: Loader::Quilt,
@@ -232,7 +237,10 @@ fn detect_quilt(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> 
     )
 }
 
-fn detect_forge(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
+fn detect_forge(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     latest_environment(
         WalkDir::new(root.join("libraries/net/minecraftforge/forge"))
             .max_depth(2)
@@ -254,7 +262,10 @@ fn detect_forge(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> 
     )
 }
 
-fn detect_neoforge(root: &Path, known_game_versions: Option<&GameVersionIndex>) -> Option<DetectedEnvironment> {
+fn detect_neoforge(
+    root: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Option<DetectedEnvironment> {
     latest_environment(
         WalkDir::new(root.join("libraries/net/neoforged/neoforge"))
             .max_depth(2)
@@ -314,8 +325,7 @@ fn looks_like_minecraft_version(value: &str) -> bool {
         return match parts.as_slice() {
             [_, suffix] => is_compact_prerelease_suffix(suffix) || is_named_version_suffix(suffix),
             [_, channel, number] => {
-                is_split_prerelease_channel(channel)
-                    && number.chars().all(|ch| ch.is_ascii_digit())
+                is_split_prerelease_channel(channel) && number.chars().all(|ch| ch.is_ascii_digit())
             }
             _ => false,
         };
@@ -330,11 +340,9 @@ fn looks_like_minecraft_version(value: &str) -> bool {
     )
 }
 
-fn supports_minecraft_version(
-    value: &str,
-    known_game_versions: Option<&GameVersionIndex>,
-) -> bool {
-    known_game_versions.is_some_and(|index| index.contains(value)) || looks_like_minecraft_version(value)
+fn supports_minecraft_version(value: &str, known_game_versions: Option<&GameVersionIndex>) -> bool {
+    known_game_versions.is_some_and(|index| index.contains(value))
+        || looks_like_minecraft_version(value)
 }
 
 fn looks_like_numeric_dotted_value(value: &str) -> bool {
@@ -368,18 +376,18 @@ fn looks_like_classic_prefixed_version(value: &str) -> bool {
 
     matches!(prefix, "a" | "b" | "c")
         && !rest.is_empty()
-        && rest.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_'))
+        && rest
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_'))
         && rest.chars().any(|ch| ch.is_ascii_digit())
 }
 
 fn is_compact_prerelease_suffix(value: &str) -> bool {
-    ["pre", "rc"]
-        .into_iter()
-        .any(|prefix| {
-            value
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+    ["pre", "rc"].into_iter().any(|prefix| {
+        value.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
         })
+    })
 }
 
 fn is_named_version_suffix(value: &str) -> bool {
@@ -405,24 +413,27 @@ fn detect_fabric_server_jars(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
     let entries = fs::read_dir(root).ok()?;
-    latest_environment(entries.filter_map(|entry| {
-        let entry = entry.ok()?;
-        if !entry.file_type().ok()?.is_file() {
-            return None;
-        }
+    latest_environment(
+        entries.filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let (loader_version, minecraft_version) = parse_root_fabric_server_jar(&file_name)?;
-        if !supports_minecraft_version(&minecraft_version, known_game_versions) {
-            return None;
-        }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let (loader_version, minecraft_version) = parse_root_fabric_server_jar(&file_name)?;
+            if !supports_minecraft_version(&minecraft_version, known_game_versions) {
+                return None;
+            }
 
-        Some(DetectedEnvironment {
-            loader: Loader::Fabric,
-            loader_version: Some(loader_version),
-            minecraft_version,
-        })
-    }), known_game_versions)
+            Some(DetectedEnvironment {
+                loader: Loader::Fabric,
+                loader_version: Some(loader_version),
+                minecraft_version,
+            })
+        }),
+        known_game_versions,
+    )
 }
 
 fn detect_dot_fabric_server_jars(
@@ -430,24 +441,27 @@ fn detect_dot_fabric_server_jars(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
     let entries = fs::read_dir(root.join(".fabric/server")).ok()?;
-    latest_environment(entries.filter_map(|entry| {
-        let entry = entry.ok()?;
-        if !entry.file_type().ok()?.is_file() {
-            return None;
-        }
+    latest_environment(
+        entries.filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let (loader_version, minecraft_version) = parse_dot_fabric_server_jar(&file_name)?;
-        if !supports_minecraft_version(&minecraft_version, known_game_versions) {
-            return None;
-        }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let (loader_version, minecraft_version) = parse_dot_fabric_server_jar(&file_name)?;
+            if !supports_minecraft_version(&minecraft_version, known_game_versions) {
+                return None;
+            }
 
-        Some(DetectedEnvironment {
-            loader: Loader::Fabric,
-            loader_version: Some(loader_version),
-            minecraft_version,
-        })
-    }), known_game_versions)
+            Some(DetectedEnvironment {
+                loader: Loader::Fabric,
+                loader_version: Some(loader_version),
+                minecraft_version,
+            })
+        }),
+        known_game_versions,
+    )
 }
 
 fn detect_fabric_library_layout(
@@ -470,12 +484,11 @@ fn detect_fabric_library_layout(
                     .file_name()?
                     .to_string_lossy()
                     .to_string();
-                let (loader_version, minecraft_version) =
-                    parse_fabric_loader_library_jar(
-                        &file_name,
-                        &parent_version,
-                        known_game_versions,
-                    )?;
+                let (loader_version, minecraft_version) = parse_fabric_loader_library_jar(
+                    &file_name,
+                    &parent_version,
+                    known_game_versions,
+                )?;
 
                 Some(DetectedEnvironment {
                     loader: Loader::Fabric,
@@ -493,24 +506,27 @@ fn detect_fabric_remapped_jars(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
     let entries = fs::read_dir(root.join(".fabric/remappedJars")).ok()?;
-    latest_environment(entries.filter_map(|entry| {
-        let entry = entry.ok()?;
-        if !entry.file_type().ok()?.is_dir() {
-            return None;
-        }
+    latest_environment(
+        entries.filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
 
-        let folder = entry.file_name().to_string_lossy().to_string();
-        let (minecraft_version, loader_version) = parse_fabric_remapped_jar_dir(&folder)?;
-        if !supports_minecraft_version(&minecraft_version, known_game_versions) {
-            return None;
-        }
+            let folder = entry.file_name().to_string_lossy().to_string();
+            let (minecraft_version, loader_version) = parse_fabric_remapped_jar_dir(&folder)?;
+            if !supports_minecraft_version(&minecraft_version, known_game_versions) {
+                return None;
+            }
 
-        Some(DetectedEnvironment {
-            loader: Loader::Fabric,
-            loader_version: Some(loader_version),
-            minecraft_version,
-        })
-    }), known_game_versions)
+            Some(DetectedEnvironment {
+                loader: Loader::Fabric,
+                loader_version: Some(loader_version),
+                minecraft_version,
+            })
+        }),
+        known_game_versions,
+    )
 }
 
 fn detect_fabric_intermediary_version(
@@ -518,15 +534,18 @@ fn detect_fabric_intermediary_version(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<String> {
     let entries = fs::read_dir(root.join("libraries/net/fabricmc/intermediary")).ok()?;
-    latest_version(entries.filter_map(|entry| {
-        let entry = entry.ok()?;
-        if !entry.file_type().ok()?.is_dir() {
-            return None;
-        }
+    latest_version(
+        entries.filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
 
-        let version = entry.file_name().to_string_lossy().to_string();
-        supports_minecraft_version(&version, known_game_versions).then_some(version)
-    }), known_game_versions)
+            let version = entry.file_name().to_string_lossy().to_string();
+            supports_minecraft_version(&version, known_game_versions).then_some(version)
+        }),
+        known_game_versions,
+    )
 }
 
 fn parse_root_fabric_server_jar(file_name: &str) -> Option<(String, String)> {
@@ -790,7 +809,9 @@ fn tokenize_version_string(value: &str) -> Vec<VersionPart<'_>> {
 fn compare_version_part(left: &VersionPart<'_>, right: &VersionPart<'_>) -> Ordering {
     match (left, right) {
         (VersionPart::Number(left), VersionPart::Number(right)) => left.cmp(right),
-        (VersionPart::Text(left), VersionPart::Text(right)) => compare_text_version_part(left, right),
+        (VersionPart::Text(left), VersionPart::Text(right)) => {
+            compare_text_version_part(left, right)
+        }
         (VersionPart::Number(_), VersionPart::Text(_)) => Ordering::Greater,
         (VersionPart::Text(_), VersionPart::Number(_)) => Ordering::Less,
     }
@@ -901,7 +922,10 @@ mod tests {
             "inf-20100618",
             "rd-161348",
         ] {
-            assert!(looks_like_minecraft_version(version), "{version} should be accepted");
+            assert!(
+                looks_like_minecraft_version(version),
+                "{version} should be accepted"
+            );
         }
     }
 
@@ -921,10 +945,7 @@ mod tests {
         );
         assert_eq!(
             split_loader_directory_version("1.7.10-10.13.4.1614-1.7.10", None),
-            Some((
-                "1.7.10".to_string(),
-                "10.13.4.1614-1.7.10".to_string()
-            ))
+            Some(("1.7.10".to_string(), "10.13.4.1614-1.7.10".to_string()))
         );
     }
 
@@ -957,10 +978,7 @@ mod tests {
 
     #[test]
     fn compares_snapshots_and_prereleases_naturally() {
-        assert_eq!(
-            compare_version_strings("25w09a", "25w10a"),
-            Ordering::Less
-        );
+        assert_eq!(compare_version_strings("25w09a", "25w10a"), Ordering::Less);
         assert_eq!(
             compare_version_strings("1.21.11-pre5", "1.21.11-pre12"),
             Ordering::Less

@@ -15,27 +15,18 @@ pub enum CandidateChoice {
     NoMatches,
 }
 
+pub fn rank_candidates(query: &str, candidates: &[SearchCandidate]) -> Vec<SearchCandidate> {
+    score_candidates(query, candidates)
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect()
+}
+
 pub fn choose_best_match(query: &str, candidates: &[SearchCandidate]) -> CandidateChoice {
-    if candidates.is_empty() {
+    let scored = score_candidates(query, candidates);
+    if scored.is_empty() {
         return CandidateChoice::NoMatches;
     }
-
-    let normalized_query = normalize(query);
-    let compact_query = compact(&normalized_query);
-    if normalized_query.is_empty() {
-        return CandidateChoice::NoMatches;
-    }
-
-    let mut scored: Vec<(SearchCandidate, f64)> = candidates
-        .iter()
-        .cloned()
-        .map(|candidate| {
-            let score = score_candidate(&normalized_query, &compact_query, &candidate);
-            (candidate, score)
-        })
-        .collect();
-
-    scored.sort_by(|left, right| right.1.total_cmp(&left.1));
 
     let Some((top_candidate, top_score)) = scored.first().cloned() else {
         return CandidateChoice::NoMatches;
@@ -58,6 +49,30 @@ pub fn choose_best_match(query: &str, candidates: &[SearchCandidate]) -> Candida
     }
 
     CandidateChoice::Selected(top_candidate)
+}
+
+fn score_candidates(query: &str, candidates: &[SearchCandidate]) -> Vec<(SearchCandidate, f64)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized_query = normalize(query);
+    let compact_query = compact(&normalized_query);
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(SearchCandidate, f64)> = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| {
+            let score = score_candidate(&normalized_query, &compact_query, &candidate);
+            (candidate, score)
+        })
+        .collect();
+
+    scored.sort_by(|left, right| right.1.total_cmp(&left.1));
+    scored
 }
 
 fn score_candidate(query: &str, compact_query: &str, candidate: &SearchCandidate) -> f64 {
@@ -188,5 +203,20 @@ mod tests {
                 1000
             ))
         );
+    }
+
+    #[test]
+    fn rank_candidates_orders_best_matches_first() {
+        let ranked = rank_candidates(
+            "shulker tooltips",
+            &[
+                candidate("1", "tooltipfix", "Tooltip Fix", 3000),
+                candidate("2", "shulkerboxtooltips", "ShulkerBox Tooltips", 1000),
+                candidate("3", "api-lib", "API Lib", 50),
+            ],
+        );
+
+        assert_eq!(ranked[0].slug, "shulkerboxtooltips");
+        assert_eq!(ranked[1].slug, "tooltipfix");
     }
 }

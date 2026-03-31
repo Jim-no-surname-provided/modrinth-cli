@@ -1,6 +1,7 @@
 mod minecraft;
 mod modrinth;
 mod search;
+mod tui;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -11,17 +12,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use minecraft::{DetectedEnvironment, GameVersionIndex, MinecraftContext};
-use modrinth::{ModrinthClient, Project, Version, VersionFile};
-use search::{CandidateChoice, SearchCandidate, choose_best_match};
+use modrinth::{ModrinthClient, Project, SearchHit, Version, VersionFile};
+use search::{CandidateChoice, SearchCandidate, choose_best_match, rank_candidates};
 use sha1::{Digest, Sha1};
+use tui::{DynamicInstallerOutcome, InstallerSelection, run_dynamic_installer};
+
+const SEARCH_RESULT_LIMIT: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchSort {
+    BestMatch,
+    Downloads,
+    Title,
+    Slug,
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "mod",
     version,
-    about = "Install and update Modrinth mods for the current Minecraft directory",
+    about = "Search, install, and update Modrinth mods",
     arg_required_else_help = true,
-    after_help = "Examples:\n  mod install sodium\n  mod install simple voice chat\n  mod update all\n  mod update sodium"
+    after_help = "Examples:\n  mod search sodium\n  mod s voice chat\n  mod search --downloads sodium\n  mod search --title sodium\n  mod search --global sodium\n  mod install sodium\n  mod install simple voice chat\n  mod dynamic-installer\n  mod update all\n  mod update sodium"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,10 +47,50 @@ enum Command {
         #[arg(help = "Project name or search query")]
         query: Vec<String>,
     },
+    #[command(
+        name = "dynamic-installer",
+        alias = "di",
+        about = "Open an interactive terminal UI for live search and multi-select install"
+    )]
+    DynamicInstaller,
     #[command(alias = "u")]
     Update {
         #[arg(help = "Installed mod name, or `all` to update everything")]
         target: Vec<String>,
+    },
+    #[command(alias = "s")]
+    Search {
+        #[arg(help = "Project name or search query")]
+        query: Vec<String>,
+        #[arg(
+            long,
+            help = "Search all Modrinth mods without filtering by detected loader or Minecraft version"
+        )]
+        global: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["best_match", "title", "slug"],
+            help = "Sort results by downloads, highest first"
+        )]
+        downloads: bool,
+        #[arg(
+            long = "best-match",
+            conflicts_with_all = ["downloads", "title", "slug"],
+            help = "Sort results by fuzzy match quality (default)"
+        )]
+        best_match: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["downloads", "best_match", "slug"],
+            help = "Sort results alphabetically by title"
+        )]
+        title: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["downloads", "best_match", "title"],
+            help = "Sort results alphabetically by slug"
+        )]
+        slug: bool,
     },
 }
 
@@ -66,29 +118,68 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir().context("failed to read current working directory")?;
     let client = ModrinthClient::new_from_env()?;
-    let known_game_versions = client
-        .game_versions()
-        .ok()
-        .map(GameVersionIndex::new);
-    let context = MinecraftContext::discover_with_game_versions(&cwd, known_game_versions.as_ref())?;
-    print_environment(&context.environment, &context.root_dir, &context.mods_dir);
-
+    let known_game_versions = client.game_versions().ok().map(GameVersionIndex::new);
     match cli.command {
         Command::Install { query } => {
             let query = join_words(query)?;
+            let context = discover_context(&cwd, known_game_versions.as_ref())?;
+            print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             install_from_query(&client, &context, &query)?;
+        }
+        Command::DynamicInstaller => {
+            let context = discover_context(&cwd, known_game_versions.as_ref())?;
+            match run_dynamic_installer(&client, &context.environment)? {
+                DynamicInstallerOutcome::Cancelled => {
+                    println!("Dynamic installer cancelled.");
+                }
+                DynamicInstallerOutcome::Install(selections) => {
+                    print_environment(&context.environment, &context.root_dir, &context.mods_dir);
+                    install_projects_from_selections(&client, &context, &selections)?;
+                }
+            }
         }
         Command::Update { target } => {
             let target = join_words(target)?;
+            let context = discover_context(&cwd, known_game_versions.as_ref())?;
+            print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             if target.eq_ignore_ascii_case("all") {
                 update_all(&client, &context)?;
             } else {
                 update_named(&client, &context, &target)?;
             }
         }
+        Command::Search {
+            query,
+            global,
+            downloads,
+            best_match,
+            title,
+            slug,
+        } => {
+            let query = join_words(query)?;
+            let sort = search_sort_from_flags(downloads, best_match, title, slug);
+            print!(
+                "{}",
+                execute_search(
+                    &client,
+                    &cwd,
+                    known_game_versions.as_ref(),
+                    &query,
+                    global,
+                    sort,
+                )?
+            );
+        }
     }
 
     Ok(())
+}
+
+fn discover_context(
+    cwd: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+) -> Result<MinecraftContext> {
+    MinecraftContext::discover_with_game_versions(cwd, known_game_versions)
 }
 
 fn install_from_query(
@@ -96,21 +187,57 @@ fn install_from_query(
     context: &MinecraftContext,
     query: &str,
 ) -> Result<()> {
-    let mut inventory = build_installed_inventory(client, context)?;
     let mut project_cache = HashMap::new();
     let project = resolve_project_query(client, &context.environment, query, &mut project_cache)?;
-    println!("Selected project: {} ({})", project.title, project.slug);
+    install_projects(client, context, vec![project], &mut project_cache)
+}
 
-    let mut visited = HashSet::new();
-    install_project_recursive(
-        client,
-        context,
-        &project,
-        &mut inventory,
-        &mut project_cache,
-        &mut visited,
-        0,
-    )
+fn install_projects_from_selections(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    selections: &[InstallerSelection],
+) -> Result<()> {
+    let mut project_cache = HashMap::new();
+    let mut projects = Vec::with_capacity(selections.len());
+
+    for selection in selections {
+        let project = fetch_project_cached(client, &mut project_cache, &selection.lookup_key)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Modrinth project {} ({}) could not be fetched",
+                    selection.title,
+                    selection.slug
+                )
+            })?;
+        projects.push(project);
+    }
+
+    install_projects(client, context, projects, &mut project_cache)
+}
+
+fn install_projects(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    projects: Vec<Project>,
+    project_cache: &mut HashMap<String, Project>,
+) -> Result<()> {
+    let mut inventory = build_installed_inventory(client, context)?;
+
+    for project in projects {
+        println!("Selected project: {} ({})", project.title, project.slug);
+        let mut visited = HashSet::new();
+        install_project_recursive(
+            client,
+            context,
+            &project,
+            &mut inventory,
+            project_cache,
+            &mut visited,
+            0,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> {
@@ -391,7 +518,7 @@ fn resolve_project_query(
         }
     }
 
-    let hits = client.search_projects(query, environment)?;
+    let hits = client.search_projects(query, Some(environment))?;
     if hits.is_empty() {
         bail!("no Modrinth mods matched `{}`", query);
     }
@@ -649,19 +776,192 @@ fn format_suggestions(candidates: &[SearchCandidate]) -> String {
         .join("\n")
 }
 
+fn execute_search(
+    client: &ModrinthClient,
+    cwd: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+    query: &str,
+    global: bool,
+    sort: SearchSort,
+) -> Result<String> {
+    let mut output = String::new();
+    let environment = if global {
+        output.push_str("Searching all Modrinth mods.\n");
+        None
+    } else {
+        match discover_context(cwd, known_game_versions) {
+            Ok(context) => {
+                output.push_str(&format_environment(
+                    &context.environment,
+                    &context.root_dir,
+                    &context.mods_dir,
+                ));
+                Some(context.environment)
+            }
+            Err(_) => {
+                output.push_str(&format!(
+                    "No Minecraft environment detected from {}. Searching all Modrinth mods instead.\n",
+                    cwd.display()
+                ));
+                None
+            }
+        }
+    };
+
+    let hits = client.search_projects(query, environment.as_ref())?;
+    let ranked = sort_search_hits(query, &hits, sort);
+    if ranked.is_empty() {
+        bail!("no Modrinth mods matched `{}`", query);
+    }
+
+    output.push_str(&format!(
+        "Search results for `{query}` (sorted by {}):\n",
+        sort.label()
+    ));
+    for candidate in ranked.iter().take(SEARCH_RESULT_LIMIT) {
+        output.push_str(&format!(
+            "- {} ({}) - {} downloads\n",
+            candidate.title,
+            candidate.slug,
+            format_download_count(candidate.downloads)
+        ));
+    }
+
+    Ok(output)
+}
+
+fn search_sort_from_flags(
+    downloads: bool,
+    best_match: bool,
+    title: bool,
+    slug: bool,
+) -> SearchSort {
+    if downloads {
+        SearchSort::Downloads
+    } else if title {
+        SearchSort::Title
+    } else if slug {
+        SearchSort::Slug
+    } else if best_match {
+        SearchSort::BestMatch
+    } else {
+        SearchSort::BestMatch
+    }
+}
+
+fn sort_search_hits(query: &str, hits: &[SearchHit], sort: SearchSort) -> Vec<SearchCandidate> {
+    let mut candidates: Vec<SearchCandidate> = hits
+        .iter()
+        .map(|hit| SearchCandidate {
+            key: hit.project_id.clone().unwrap_or_else(|| hit.slug.clone()),
+            slug: hit.slug.clone(),
+            title: hit.title.clone(),
+            downloads: hit.downloads,
+        })
+        .collect();
+
+    match sort {
+        SearchSort::BestMatch => rank_candidates(query, &candidates),
+        SearchSort::Downloads => {
+            candidates.sort_by(|left, right| {
+                right
+                    .downloads
+                    .cmp(&left.downloads)
+                    .then_with(|| {
+                        left.title
+                            .to_ascii_lowercase()
+                            .cmp(&right.title.to_ascii_lowercase())
+                    })
+                    .then_with(|| {
+                        left.slug
+                            .to_ascii_lowercase()
+                            .cmp(&right.slug.to_ascii_lowercase())
+                    })
+            });
+            candidates
+        }
+        SearchSort::Title => {
+            candidates.sort_by(|left, right| {
+                left.title
+                    .to_ascii_lowercase()
+                    .cmp(&right.title.to_ascii_lowercase())
+                    .then_with(|| {
+                        left.slug
+                            .to_ascii_lowercase()
+                            .cmp(&right.slug.to_ascii_lowercase())
+                    })
+                    .then_with(|| right.downloads.cmp(&left.downloads))
+            });
+            candidates
+        }
+        SearchSort::Slug => {
+            candidates.sort_by(|left, right| {
+                left.slug
+                    .to_ascii_lowercase()
+                    .cmp(&right.slug.to_ascii_lowercase())
+                    .then_with(|| {
+                        left.title
+                            .to_ascii_lowercase()
+                            .cmp(&right.title.to_ascii_lowercase())
+                    })
+                    .then_with(|| right.downloads.cmp(&left.downloads))
+            });
+            candidates
+        }
+    }
+}
+
+impl SearchSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BestMatch => "best match",
+            Self::Downloads => "downloads",
+            Self::Title => "title",
+            Self::Slug => "slug",
+        }
+    }
+}
+
 fn print_environment(environment: &DetectedEnvironment, root_dir: &Path, mods_dir: &Path) {
+    print!("{}", format_environment(environment, root_dir, mods_dir));
+}
+
+fn format_environment(
+    environment: &DetectedEnvironment,
+    root_dir: &Path,
+    mods_dir: &Path,
+) -> String {
     match environment.loader_version.as_deref() {
-        Some(loader_version) => println!(
-            "Detected {} {} on Minecraft {}",
-            environment.loader, loader_version, environment.minecraft_version
+        Some(loader_version) => format!(
+            "Detected {} {} on Minecraft {}\nRoot: {}\nMods: {}\n",
+            environment.loader,
+            loader_version,
+            environment.minecraft_version,
+            root_dir.display(),
+            mods_dir.display()
         ),
-        None => println!(
-            "Detected {} on Minecraft {}",
-            environment.loader, environment.minecraft_version
+        None => format!(
+            "Detected {} on Minecraft {}\nRoot: {}\nMods: {}\n",
+            environment.loader,
+            environment.minecraft_version,
+            root_dir.display(),
+            mods_dir.display()
         ),
     }
-    println!("Root: {}", root_dir.display());
-    println!("Mods: {}", mods_dir.display());
+}
+
+fn format_download_count(downloads: u64) -> String {
+    let digits = downloads.to_string();
+    let mut reversed = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            reversed.push(',');
+        }
+        reversed.push(ch);
+    }
+
+    reversed.chars().rev().collect()
 }
 
 fn bytes_to_hex(bytes: impl AsRef<[u8]>) -> String {
@@ -676,6 +976,7 @@ fn bytes_to_hex(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
     use serde_json::json;
@@ -762,6 +1063,20 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn mock_search_hit(
+        project_id: &str,
+        slug: &str,
+        title: &str,
+        downloads: u64,
+    ) -> serde_json::Value {
+        json!({
+            "project_id": project_id,
+            "slug": slug,
+            "title": title,
+            "downloads": downloads
+        })
     }
 
     fn write_modern_dot_fabric_root(root: &Path) {
@@ -1109,6 +1424,164 @@ mod tests {
     }
 
     #[test]
+    fn search_lists_ranked_results() {
+        let temp = tempdir().unwrap();
+        write_fabric_root(temp.path());
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/search");
+            then.status(200).json_body(json!({
+                "hits": [
+                    mock_search_hit("3", "api-lib", "API Lib", 50),
+                    mock_search_hit("1", "tooltipfix", "Tooltip Fix", 3000),
+                    mock_search_hit("2", "shulkerboxtooltips", "ShulkerBox Tooltips", 1000)
+                ]
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let output = execute_search(
+            &client,
+            temp.path(),
+            None,
+            "shulker tooltips",
+            false,
+            SearchSort::BestMatch,
+        )
+        .unwrap();
+
+        assert!(output.contains("Detected fabric 0.16.10 on Minecraft 1.21.1"));
+        assert!(output.contains("Search results for `shulker tooltips` (sorted by best match):"));
+        let shulker_pos = output.find("ShulkerBox Tooltips").unwrap();
+        let tooltip_fix_pos = output.find("Tooltip Fix").unwrap();
+        assert!(shulker_pos < tooltip_fix_pos);
+    }
+
+    #[test]
+    fn search_global_works_without_detected_environment() {
+        let temp = tempdir().unwrap();
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/search");
+            then.status(200).json_body(json!({
+                "hits": [mock_search_hit("1", "sodium", "Sodium", 100000)]
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let output = execute_search(
+            &client,
+            temp.path(),
+            None,
+            "sodium",
+            true,
+            SearchSort::BestMatch,
+        )
+        .unwrap();
+
+        assert!(output.contains("Searching all Modrinth mods."));
+        assert!(output.contains("Sodium (sodium) - 100,000 downloads"));
+        assert!(!output.contains("No Minecraft environment detected"));
+    }
+
+    #[test]
+    fn search_falls_back_to_global_results_when_no_environment_is_detected() {
+        let temp = tempdir().unwrap();
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/search");
+            then.status(200).json_body(json!({
+                "hits": [mock_search_hit("1", "sodium", "Sodium", 100000)]
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let output = execute_search(
+            &client,
+            temp.path(),
+            None,
+            "sodium",
+            false,
+            SearchSort::BestMatch,
+        )
+        .unwrap();
+
+        assert!(output.contains("No Minecraft environment detected"));
+        assert!(output.contains("Searching all Modrinth mods instead."));
+        assert!(output.contains("Sodium (sodium) - 100,000 downloads"));
+    }
+
+    #[test]
+    fn top_level_help_includes_search_command_and_examples() {
+        let help = Cli::command().render_help().to_string();
+
+        assert!(help.contains("search"));
+        assert!(help.contains("dynamic-installer"));
+        assert!(help.contains("mod search sodium"));
+        assert!(help.contains("mod s voice chat"));
+        assert!(help.contains("mod search --downloads sodium"));
+        assert!(help.contains("mod search --title sodium"));
+        assert!(help.contains("mod search --global sodium"));
+        assert!(help.contains("mod dynamic-installer"));
+    }
+
+    #[test]
+    fn search_downloads_sort_prefers_most_downloaded_results() {
+        let temp = tempdir().unwrap();
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/search");
+            then.status(200).json_body(json!({
+                "hits": [
+                    mock_search_hit("1", "sodium", "Sodium", 100000),
+                    mock_search_hit("2", "sodium-extra", "Sodium Extra", 200000)
+                ]
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let output = execute_search(
+            &client,
+            temp.path(),
+            None,
+            "sodium",
+            true,
+            SearchSort::Downloads,
+        )
+        .unwrap();
+
+        assert!(output.contains("Search results for `sodium` (sorted by downloads):"));
+        let sodium_extra_pos = output.find("Sodium Extra").unwrap();
+        let sodium_pos = output.find("Sodium (sodium)").unwrap();
+        assert!(sodium_extra_pos < sodium_pos);
+    }
+
+    #[test]
+    fn search_subcommand_help_includes_sort_flags() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("search")
+            .unwrap()
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("--downloads"));
+        assert!(help.contains("--best-match"));
+        assert!(help.contains("--title"));
+        assert!(help.contains("--slug"));
+    }
+
+    #[test]
+    fn dynamic_installer_alias_parses() {
+        let cli = Cli::try_parse_from(["mod", "di"]).unwrap();
+        assert!(matches!(cli.command, Command::DynamicInstaller));
+    }
+
+    #[test]
     fn install_query_fetches_fuzzy_match_and_dependency() {
         let temp = tempdir().unwrap();
         write_fabric_root(temp.path());
@@ -1281,5 +1754,97 @@ mod tests {
         update_all(&client, &context).unwrap();
 
         assert_eq!(compute_sha1(&installed_path).unwrap(), latest_sha1);
+    }
+
+    #[test]
+    fn dynamic_installer_batch_installs_multiple_selected_projects() {
+        let temp = tempdir().unwrap();
+        write_fabric_root(temp.path());
+        let root = temp.path();
+        let context = MinecraftContext::discover(root).unwrap();
+        let server = MockServer::start();
+
+        let sodium_bytes = b"sodium";
+        let sodium_sha1 = bytes_to_hex(&Sha1::digest(sodium_bytes));
+        let iris_bytes = b"iris";
+        let iris_sha1 = bytes_to_hex(&Sha1::digest(iris_bytes));
+
+        server.mock(|when, then| {
+            when.method(GET).path("/project/proj-sodium");
+            then.status(200)
+                .json_body(mock_project("proj-sodium", "sodium", "Sodium", 100000));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/project/proj-iris");
+            then.status(200)
+                .json_body(mock_project("proj-iris", "iris", "Iris", 75000));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/project/proj-sodium/version");
+            then.status(200).json_body(json!([mock_version(
+                "ver-sodium",
+                "proj-sodium",
+                "2.0.0",
+                "release",
+                &sodium_sha1,
+                "sodium.jar",
+                &server.url("/files/sodium.jar"),
+                json!([])
+            )]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/project/proj-iris/version");
+            then.status(200).json_body(json!([mock_version(
+                "ver-iris",
+                "proj-iris",
+                "3.0.0",
+                "release",
+                &iris_sha1,
+                "iris.jar",
+                &server.url("/files/iris.jar"),
+                json!([])
+            )]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/files/sodium.jar");
+            then.status(200).body(sodium_bytes);
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/files/iris.jar");
+            then.status(200).body(iris_bytes);
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        install_projects_from_selections(
+            &client,
+            &context,
+            &[
+                InstallerSelection {
+                    lookup_key: "proj-sodium".to_string(),
+                    slug: "sodium".to_string(),
+                    title: "Sodium".to_string(),
+                },
+                InstallerSelection {
+                    lookup_key: "proj-iris".to_string(),
+                    slug: "iris".to_string(),
+                    title: "Iris".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            compute_sha1(&root.join("mods/sodium.jar")).unwrap(),
+            sodium_sha1
+        );
+        assert_eq!(
+            compute_sha1(&root.join("mods/iris.jar")).unwrap(),
+            iris_sha1
+        );
     }
 }
