@@ -8,11 +8,12 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use minecraft::{DetectedEnvironment, GameVersionIndex, MinecraftContext};
-use modrinth::{ModrinthClient, Project, SearchHit, Version, VersionFile};
+use modrinth::{CacheStats, ModrinthClient, Project, SearchHit, Version, VersionFile};
 use search::{CandidateChoice, SearchCandidate, choose_best_match, rank_candidates};
 use sha1::{Digest, Sha1};
 use tui::{DynamicInstallerOutcome, InstallerSelection, run_dynamic_installer};
@@ -33,7 +34,7 @@ enum SearchSort {
     version,
     about = "Search, install, and update Modrinth mods",
     arg_required_else_help = true,
-    after_help = "Examples:\n  mod search sodium\n  mod s voice chat\n  mod search --downloads sodium\n  mod search --title sodium\n  mod search --global sodium\n  mod install sodium\n  mod install simple voice chat\n  mod dynamic-installer\n  mod update all\n  mod update sodium"
+    after_help = "Examples:\n  mod search sodium\n  mod s voice chat\n  mod search --downloads sodium\n  mod search --title sodium\n  mod search --global sodium\n  mod install sodium\n  mod install simple voice chat\n  mod dynamic-installer\n  mod update all\n  mod update sodium\n  mod cache\n  mod cache clear"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -92,6 +93,20 @@ enum Command {
         )]
         slug: bool,
     },
+    #[command(
+        about = "Inspect or clear the local Modrinth API cache",
+        arg_required_else_help = false
+    )]
+    Cache {
+        #[command(subcommand)]
+        command: Option<CacheCommand>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommand {
+    #[command(about = "Delete all cached Modrinth API responses")]
+    Clear,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +189,31 @@ fn run() -> Result<()> {
                     sort,
                 )?
             );
+        }
+        Command::Cache { command } => {
+            handle_cache_command(&client, command)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_cache_command(client: &ModrinthClient, command: Option<CacheCommand>) -> Result<()> {
+    match command {
+        None => {
+            let stats = client.cache_stats()?;
+            print!("{}", format_cache_stats(&stats));
+        }
+        Some(CacheCommand::Clear) => {
+            let cleared = client.clear_cache()?;
+            let stats = client.cache_stats()?;
+            println!(
+                "Cleared {} cached response{} ({})",
+                cleared.removed_entries,
+                if cleared.removed_entries == 1 { "" } else { "s" },
+                format_bytes(cleared.removed_bytes)
+            );
+            println!("Cache directory: {}", stats.dir.display());
         }
     }
 
@@ -1082,6 +1122,61 @@ fn format_download_count(downloads: u64) -> String {
     reversed.chars().rev().collect()
 }
 
+fn format_cache_stats(stats: &CacheStats) -> String {
+    let usage_percent = if stats.max_bytes == 0 {
+        0.0
+    } else {
+        (stats.total_bytes as f64 / stats.max_bytes as f64) * 100.0
+    };
+
+    format!(
+        "Cache directory: {}\nEntries: {}\nUsage: {} / {} ({usage_percent:.1}%)\nTTL: {}\nEviction: oldest files first when limit is exceeded\n",
+        stats.dir.display(),
+        stats.entry_count,
+        format_bytes(stats.total_bytes),
+        format_bytes(stats.max_bytes),
+        format_duration(stats.ttl),
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if value >= 10.0 || unit_index == 0 {
+        format!("{value:.0} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds % 86_400 == 0 {
+        let days = seconds / 86_400;
+        return format!("{days} day{}", if days == 1 { "" } else { "s" });
+    }
+    if seconds % 3_600 == 0 {
+        let hours = seconds / 3_600;
+        return format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
+    }
+    if seconds % 60 == 0 {
+        let minutes = seconds / 60;
+        return format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" });
+    }
+    format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+}
+
 fn bytes_to_hex(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -1637,6 +1732,7 @@ mod tests {
         let help = Cli::command().render_help().to_string();
 
         assert!(help.contains("search"));
+        assert!(help.contains("cache"));
         assert!(help.contains("dynamic-installer"));
         assert!(help.contains("mod search sodium"));
         assert!(help.contains("mod s voice chat"));
@@ -1644,6 +1740,8 @@ mod tests {
         assert!(help.contains("mod search --title sodium"));
         assert!(help.contains("mod search --global sodium"));
         assert!(help.contains("mod dynamic-installer"));
+        assert!(help.contains("mod cache"));
+        assert!(help.contains("mod cache clear"));
     }
 
     #[test]
@@ -1697,6 +1795,30 @@ mod tests {
     fn dynamic_installer_alias_parses() {
         let cli = Cli::try_parse_from(["mod", "di"]).unwrap();
         assert!(matches!(cli.command, Command::DynamicInstaller));
+    }
+
+    #[test]
+    fn cache_clear_subcommand_parses() {
+        let cli = Cli::try_parse_from(["mod", "cache", "clear"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Cache {
+                command: Some(CacheCommand::Clear)
+            }
+        ));
+    }
+
+    #[test]
+    fn cache_subcommand_help_mentions_clear() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("cache")
+            .unwrap()
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("Inspect or clear the local Modrinth API cache"));
+        assert!(help.contains("clear"));
     }
 
     #[test]

@@ -1,20 +1,44 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 use crate::minecraft::DetectedEnvironment;
 
 const DEFAULT_API_BASE: &str = "https://api.modrinth.com/v2";
+const DEFAULT_CACHE_LIMIT_MB: u64 = 64;
+const DEFAULT_CACHE_TTL_SECS: u64 = 60 * 60 * 12;
+const MEGABYTE: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub dir: PathBuf,
+    pub max_bytes: u64,
+    pub ttl: Duration,
+    pub entry_count: usize,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheClearResult {
+    pub removed_entries: usize,
+    pub removed_bytes: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ModrinthClient {
     base_url: String,
     http: Client,
+    cache: ResponseCache,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,8 +131,26 @@ struct GameVersionTag {
     version: String,
 }
 
+#[derive(Debug, Clone)]
+struct ResponseCache {
+    dir: PathBuf,
+    max_bytes: u64,
+    ttl: Duration,
+}
+
+#[derive(Debug)]
+struct CacheEntryInfo {
+    path: PathBuf,
+    modified: SystemTime,
+    size: u64,
+}
+
 impl ModrinthClient {
     pub fn new(base_url: String) -> Result<Self> {
+        Self::new_with_cache(base_url, ResponseCache::from_env())
+    }
+
+    fn new_with_cache(base_url: String, cache: ResponseCache) -> Result<Self> {
         let http = Client::builder()
             .user_agent(format!("modrinth-cli/{}", env!("CARGO_PKG_VERSION")))
             .build()
@@ -117,6 +159,7 @@ impl ModrinthClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            cache,
         })
     }
 
@@ -127,38 +170,24 @@ impl ModrinthClient {
     }
 
     pub fn game_versions(&self) -> Result<Vec<String>> {
-        let tags: Vec<GameVersionTag> = self
-            .http
-            .get(format!("{}/tag/game_version", self.base_url))
-            .send()
-            .context("failed to fetch Modrinth game versions")?
-            .error_for_status()
-            .context("game versions request failed")?
-            .json()
-            .context("failed to decode Modrinth game versions response")?;
+        let tags: Vec<GameVersionTag> = self.get_json_cached(
+            format!("{}/tag/game_version", self.base_url),
+            "failed to fetch Modrinth game versions",
+            "game versions request failed",
+            "failed to decode Modrinth game versions response",
+        )?;
 
         Ok(tags.into_iter().map(|tag| tag.version).collect())
     }
 
     pub fn get_project(&self, id_or_slug: &str) -> Result<Option<Project>> {
         let url = format!("{}/project/{}", self.base_url, id_or_slug);
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .context("failed to fetch project")?;
-
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        Ok(Some(
-            response
-                .error_for_status()
-                .context("project request failed")?
-                .json()
-                .context("failed to decode project response")?,
-        ))
+        self.get_optional_json_cached(
+            url,
+            "failed to fetch project",
+            "project request failed",
+            "failed to decode project response",
+        )
     }
 
     pub fn search_projects(
@@ -180,17 +209,12 @@ impl ModrinthClient {
             urlencoding::encode(&facets)
         );
 
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .context("failed to search Modrinth")?
-            .error_for_status()
-            .context("Modrinth search failed")?;
-
-        let parsed: SearchResponse = response
-            .json()
-            .context("failed to decode Modrinth search response")?;
+        let parsed: SearchResponse = self.get_json_cached(
+            url,
+            "failed to search Modrinth",
+            "Modrinth search failed",
+            "failed to decode Modrinth search response",
+        )?;
         Ok(parsed.hits)
     }
 
@@ -209,37 +233,24 @@ impl ModrinthClient {
             urlencoding::encode(&game_versions)
         );
 
-        self.http
-            .get(url)
-            .send()
-            .context("failed to fetch project versions")?
-            .error_for_status()
-            .context("project versions request failed")?
-            .json()
-            .context("failed to decode project versions response")
+        self.get_json_cached(
+            url,
+            "failed to fetch project versions",
+            "project versions request failed",
+            "failed to decode project versions response",
+        )
     }
 
     pub fn version_from_hash(&self, sha1: &str) -> Result<Option<Version>> {
-        let response = self
-            .http
-            .get(format!(
+        self.get_optional_json_cached(
+            format!(
                 "{}/version_file/{}?algorithm=sha1",
                 self.base_url, sha1
-            ))
-            .send()
-            .context("failed to lookup installed mod by hash")?;
-
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        Ok(Some(
-            response
-                .error_for_status()
-                .context("version-from-hash request failed")?
-                .json()
-                .context("failed to decode version-from-hash response")?,
-        ))
+            ),
+            "failed to lookup installed mod by hash",
+            "version-from-hash request failed",
+            "failed to decode version-from-hash response",
+        )
     }
 
     pub fn latest_versions_for_hashes(
@@ -258,15 +269,13 @@ impl ModrinthClient {
             game_versions: vec![environment.minecraft_version.clone()],
         };
 
-        self.http
-            .post(format!("{}/version_files/update", self.base_url))
-            .json(&body)
-            .send()
-            .context("failed to query latest versions from hashes")?
-            .error_for_status()
-            .context("latest versions request failed")?
-            .json()
-            .context("failed to decode latest versions response")
+        self.post_json_cached(
+            format!("{}/version_files/update", self.base_url),
+            &body,
+            "failed to query latest versions from hashes",
+            "latest versions request failed",
+            "failed to decode latest versions response",
+        )
     }
 
     pub fn download(&self, url: &str) -> Result<Response> {
@@ -277,6 +286,314 @@ impl ModrinthClient {
             .error_for_status()
             .with_context(|| format!("download failed for {}", url))
     }
+
+    pub fn cache_stats(&self) -> Result<CacheStats> {
+        self.cache.stats()
+    }
+
+    pub fn clear_cache(&self) -> Result<CacheClearResult> {
+        self.cache.clear()
+    }
+
+    fn get_json_cached<T>(
+        &self,
+        url: String,
+        fetch_context: &str,
+        request_context: &str,
+        decode_context: &str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let cache_key = self.cache.key_for("GET", &url, None);
+        if let Some(bytes) = self.cache.read(&cache_key) {
+            return serde_json::from_slice(&bytes)
+                .with_context(|| decode_context.to_string());
+        }
+
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| fetch_context.to_string())?
+            .error_for_status()
+            .with_context(|| request_context.to_string())?;
+        let bytes = response
+            .bytes()
+            .with_context(|| decode_context.to_string())?
+            .to_vec();
+        self.cache.write(&cache_key, &bytes);
+        serde_json::from_slice(&bytes).with_context(|| decode_context.to_string())
+    }
+
+    fn get_optional_json_cached<T>(
+        &self,
+        url: String,
+        fetch_context: &str,
+        request_context: &str,
+        decode_context: &str,
+    ) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let cache_key = self.cache.key_for("GET", &url, None);
+        if let Some(bytes) = self.cache.read(&cache_key) {
+            return serde_json::from_slice(&bytes)
+                .map(Some)
+                .with_context(|| decode_context.to_string());
+        }
+
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| fetch_context.to_string())?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let response = response
+            .error_for_status()
+            .with_context(|| request_context.to_string())?;
+        let bytes = response
+            .bytes()
+            .with_context(|| decode_context.to_string())?
+            .to_vec();
+        self.cache.write(&cache_key, &bytes);
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| decode_context.to_string())
+    }
+
+    fn post_json_cached<T, B>(
+        &self,
+        url: String,
+        body: &B,
+        fetch_context: &str,
+        request_context: &str,
+        decode_context: &str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
+        let body_bytes = serde_json::to_vec(body).context("failed to encode request body")?;
+        let cache_key = self.cache.key_for("POST", &url, Some(&body_bytes));
+        if let Some(bytes) = self.cache.read(&cache_key) {
+            return serde_json::from_slice(&bytes)
+                .with_context(|| decode_context.to_string());
+        }
+
+        let response = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .with_context(|| fetch_context.to_string())?
+            .error_for_status()
+            .with_context(|| request_context.to_string())?;
+        let bytes = response
+            .bytes()
+            .with_context(|| decode_context.to_string())?
+            .to_vec();
+        self.cache.write(&cache_key, &bytes);
+        serde_json::from_slice(&bytes).with_context(|| decode_context.to_string())
+    }
+}
+
+impl ResponseCache {
+    fn from_env() -> Self {
+        let max_bytes = env::var("MODRINTH_CACHE_LIMIT_MB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CACHE_LIMIT_MB)
+            .saturating_mul(MEGABYTE);
+        let ttl = Duration::from_secs(
+            env::var("MODRINTH_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CACHE_TTL_SECS),
+        );
+
+        Self::new(default_cache_dir(), max_bytes, ttl)
+    }
+
+    fn new(dir: PathBuf, max_bytes: u64, ttl: Duration) -> Self {
+        Self {
+            dir,
+            max_bytes,
+            ttl,
+        }
+    }
+
+    fn read(&self, key: &str) -> Option<Vec<u8>> {
+        if !self.is_enabled() {
+            return None;
+        }
+
+        let path = self.path_for(key);
+        let metadata = fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+        if self.is_stale(modified) {
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+
+        fs::read(path).ok()
+    }
+
+    fn write(&self, key: &str, bytes: &[u8]) {
+        let _ = self.write_inner(key, bytes);
+    }
+
+    fn write_inner(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("failed to create cache directory {}", self.dir.display()))?;
+        let path = self.path_for(key);
+        let temp_path = path.with_extension("tmp");
+        fs::write(&temp_path, bytes)
+            .with_context(|| format!("failed to write cache file {}", temp_path.display()))?;
+        fs::rename(&temp_path, &path)
+            .with_context(|| format!("failed to move cache file {}", path.display()))?;
+        self.evict_oldest_entries()
+    }
+
+    fn evict_oldest_entries(&self) -> Result<()> {
+        let mut entries = self.entry_infos()?;
+        let mut total_size: u64 = entries.iter().map(|entry| entry.size).sum();
+        if total_size <= self.max_bytes {
+            return Ok(());
+        }
+
+        entries.sort_by(|left, right| left.modified.cmp(&right.modified));
+        for entry in entries {
+            fs::remove_file(&entry.path)
+                .with_context(|| format!("failed to remove cache file {}", entry.path.display()))?;
+            total_size = total_size.saturating_sub(entry.size);
+            if total_size <= self.max_bytes {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn entry_infos(&self) -> Result<Vec<CacheEntryInfo>> {
+        let mut entries = Vec::new();
+        if !self.dir.exists() {
+            return Ok(entries);
+        }
+
+        for entry in fs::read_dir(&self.dir)
+            .with_context(|| format!("failed to read cache directory {}", self.dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let metadata = entry.metadata()?;
+            entries.push(CacheEntryInfo {
+                path,
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                size: metadata.len(),
+            });
+        }
+
+        Ok(entries)
+    }
+
+    fn stats(&self) -> Result<CacheStats> {
+        let entries = self.entry_infos()?;
+        Ok(CacheStats {
+            dir: self.dir.clone(),
+            max_bytes: self.max_bytes,
+            ttl: self.ttl,
+            entry_count: entries.len(),
+            total_bytes: entries.iter().map(|entry| entry.size).sum(),
+        })
+    }
+
+    fn clear(&self) -> Result<CacheClearResult> {
+        let entries = self.entry_infos()?;
+        let removed_entries = entries.len();
+        let removed_bytes = entries.iter().map(|entry| entry.size).sum();
+
+        for entry in entries {
+            fs::remove_file(&entry.path)
+                .with_context(|| format!("failed to remove cache file {}", entry.path.display()))?;
+        }
+
+        Ok(CacheClearResult {
+            removed_entries,
+            removed_bytes,
+        })
+    }
+
+    fn key_for(&self, method: &str, url: &str, body: Option<&[u8]>) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(method.as_bytes());
+        hasher.update([0]);
+        hasher.update(url.as_bytes());
+        hasher.update([0]);
+        if let Some(body) = body {
+            hasher.update(body);
+        }
+        bytes_to_hex(&hasher.finalize())
+    }
+
+    fn path_for(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("{key}.cache"))
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.max_bytes > 0 && !self.ttl.is_zero()
+    }
+
+    fn is_stale(&self, modified: SystemTime) -> bool {
+        SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age > self.ttl)
+    }
+}
+
+fn default_cache_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("MODRINTH_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(dir).join("modrinth-cli/http");
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Caches/modrinth-cli/http");
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(dir) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(dir).join("modrinth-cli/http");
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache/modrinth-cli/http");
+    }
+
+    env::temp_dir().join("modrinth-cli/http")
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 impl Version {
@@ -329,6 +646,8 @@ mod tests {
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use serde_json::json;
+    use std::thread;
+    use tempfile::tempdir;
 
     #[test]
     fn fetches_game_versions_from_modrinth_tags() {
@@ -422,5 +741,77 @@ mod tests {
         mock.assert();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].slug, "sodium");
+    }
+
+    #[test]
+    fn cache_reuses_successful_get_responses() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/tag/game_version");
+            then.status(200).json_body(json!([{ "version": "1.21.11" }]));
+        });
+        let temp_dir = tempdir().unwrap();
+        let client = ModrinthClient::new_with_cache(
+            server.base_url(),
+            ResponseCache::new(temp_dir.path().join("cache"), 1024 * 1024, Duration::from_secs(60)),
+        )
+        .unwrap();
+
+        let first = client.game_versions().unwrap();
+        let second = client.game_versions().unwrap();
+
+        assert_eq!(first, vec!["1.21.11"]);
+        assert_eq!(second, vec!["1.21.11"]);
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[test]
+    fn cache_evicts_oldest_entries_when_over_limit() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ResponseCache::new(
+            temp_dir.path().join("cache"),
+            20,
+            Duration::from_secs(60),
+        );
+
+        cache.write_inner("oldest", b"1234567890").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        cache.write_inner("middle", b"abcdefghij").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        cache.write_inner("newest", b"ABCDEFGHIJ").unwrap();
+
+        assert!(cache.read("oldest").is_none());
+        assert_eq!(cache.read("middle").unwrap(), b"abcdefghij");
+        assert_eq!(cache.read("newest").unwrap(), b"ABCDEFGHIJ");
+    }
+
+    #[test]
+    fn cache_clear_removes_all_entries_and_reports_usage() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ResponseCache::new(
+            temp_dir.path().join("cache"),
+            1024,
+            Duration::from_secs(60),
+        );
+
+        cache.write_inner("one", b"12345").unwrap();
+        cache.write_inner("two", b"6789").unwrap();
+
+        let stats = cache.stats().unwrap();
+        assert_eq!(stats.entry_count, 2);
+        assert_eq!(stats.total_bytes, 9);
+
+        let cleared = cache.clear().unwrap();
+        assert_eq!(
+            cleared,
+            CacheClearResult {
+                removed_entries: 2,
+                removed_bytes: 9,
+            }
+        );
+
+        let stats = cache.stats().unwrap();
+        assert_eq!(stats.entry_count, 0);
+        assert_eq!(stats.total_bytes, 0);
     }
 }
