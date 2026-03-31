@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::minecraft::DetectedEnvironment;
-use crate::modrinth::{ModrinthClient, SearchHit};
+use crate::modrinth::{CacheKind, CacheSettings, ModrinthClient, SearchHit};
 use crate::search::{SearchCandidate, rank_candidates};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -63,6 +63,13 @@ pub fn run_dynamic_installer(
     result
 }
 
+pub fn run_cache_settings_editor(initial: &CacheSettings) -> Result<Option<CacheSettings>> {
+    let mut terminal = ratatui::try_init()?;
+    let result = run_cache_settings_app(&mut terminal, initial);
+    ratatui::try_restore()?;
+    result
+}
+
 fn run_app(
     terminal: &mut DefaultTerminal,
     client: &ModrinthClient,
@@ -91,6 +98,204 @@ fn run_app(
 
 fn is_actionable_key(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn run_cache_settings_app(
+    terminal: &mut DefaultTerminal,
+    initial: &CacheSettings,
+) -> Result<Option<CacheSettings>> {
+    let mut app = CacheSettingsApp::new(initial.clone());
+
+    loop {
+        terminal.draw(|frame| app.render(frame))?;
+
+        if event::poll(EVENT_POLL_INTERVAL)? {
+            match event::read()? {
+                Event::Key(key) if is_actionable_key(&key) => {
+                    if let Some(outcome) = app.handle_key(key) {
+                        return Ok(match outcome {
+                            CacheSettingsOutcome::Cancelled => None,
+                            CacheSettingsOutcome::Saved(settings) => Some(settings),
+                        });
+                    }
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CacheSettingsOutcome {
+    Cancelled,
+    Saved(CacheSettings),
+}
+
+struct CacheSettingsApp {
+    settings: CacheSettings,
+    list_state: ListState,
+    status: String,
+}
+
+impl CacheSettingsApp {
+    fn new(settings: CacheSettings) -> Self {
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        Self {
+            settings,
+            list_state,
+            status: "Space toggles the highlighted cache group. Enter saves and exits. Esc cancels.".to_string(),
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<CacheSettingsOutcome> {
+        match key.code {
+            KeyCode::Esc => Some(CacheSettingsOutcome::Cancelled),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(CacheSettingsOutcome::Cancelled)
+            }
+            KeyCode::Up => {
+                self.select_previous();
+                None
+            }
+            KeyCode::Down => {
+                self.select_next();
+                None
+            }
+            KeyCode::Home => {
+                self.list_state.select(Some(0));
+                None
+            }
+            KeyCode::End => {
+                self.list_state.select(Some(CacheKind::ALL.len().saturating_sub(1)));
+                None
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_current();
+                None
+            }
+            KeyCode::Enter => Some(CacheSettingsOutcome::Saved(self.settings.clone())),
+            _ => None,
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let layout = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(5),
+        ])
+        .split(frame.area());
+
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "Cache Settings",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "Choose exactly which Modrinth responses stay on disk.",
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "Each row controls one cache category. Disabled rows stop future reads and writes for that category.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Policy"));
+        frame.render_widget(header, layout[0]);
+
+        let items: Vec<ListItem> = CacheKind::ALL
+            .iter()
+            .map(|kind| {
+                let checked = self.settings.is_enabled(*kind);
+                let marker = if checked { "[x]" } else { "[ ]" };
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            marker,
+                            Style::default().fg(if checked { Color::Green } else { Color::DarkGray }),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            kind.label(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        kind.description(),
+                        Style::default().fg(Color::Gray),
+                    )),
+                ])
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Cached Endpoints")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .highlight_symbol(">> ")
+            .highlight_style(Style::default().bg(Color::DarkGray));
+        frame.render_stateful_widget(list, layout[1], &mut self.list_state);
+
+        let footer = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Up/Down", Style::default().fg(Color::Cyan)),
+                Span::raw(" move   "),
+                Span::styled("Space", Style::default().fg(Color::Cyan)),
+                Span::raw(" toggle   "),
+                Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                Span::raw(" save and quit   "),
+                Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                Span::raw(" cancel"),
+            ]),
+            Line::from(self.status.as_str()),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Controls"))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(Clear, layout[2]);
+        frame.render_widget(footer, layout[2]);
+    }
+
+    fn toggle_current(&mut self) {
+        let Some(kind) = self.current_kind() else {
+            return;
+        };
+        let next = !self.settings.is_enabled(kind);
+        self.settings.set_enabled(kind, next);
+        self.status = format!(
+            "{} caching {}.",
+            kind.label(),
+            if next { "enabled" } else { "disabled" }
+        );
+    }
+
+    fn current_kind(&self) -> Option<CacheKind> {
+        self.list_state
+            .selected()
+            .and_then(|index| CacheKind::ALL.get(index).copied())
+    }
+
+    fn select_next(&mut self) {
+        let next = match self.list_state.selected() {
+            Some(index) => cmp::min(index + 1, CacheKind::ALL.len().saturating_sub(1)),
+            None => 0,
+        };
+        self.list_state.select(Some(next));
+    }
+
+    fn select_previous(&mut self) {
+        let previous = self.list_state.selected().unwrap_or(0).saturating_sub(1);
+        self.list_state.select(Some(previous));
+    }
 }
 
 struct DynamicInstallerApp<'a> {
@@ -899,5 +1104,32 @@ mod tests {
             ranked[0].installed_label.as_deref(),
             Some("Already downloaded (2.0.0)")
         );
+    }
+
+    #[test]
+    fn cache_settings_app_toggles_current_row_with_space() {
+        let mut app = CacheSettingsApp::new(CacheSettings::default());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert!(!app.settings.game_versions);
+        assert!(app.status.contains("Game version tags"));
+    }
+
+    #[test]
+    fn cache_settings_app_moves_and_saves() {
+        let mut app = CacheSettingsApp::new(CacheSettings::default());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match outcome {
+            Some(CacheSettingsOutcome::Saved(settings)) => {
+                assert!(!settings.projects);
+                assert!(settings.game_versions);
+            }
+            _ => panic!("expected saved cache settings"),
+        }
     }
 }

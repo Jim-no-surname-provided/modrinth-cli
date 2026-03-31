@@ -19,13 +19,35 @@ const DEFAULT_CACHE_LIMIT_MB: u64 = 64;
 const DEFAULT_CACHE_TTL_SECS: u64 = 60 * 60 * 12;
 const MEGABYTE: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheKind {
+    GameVersions,
+    Projects,
+    SearchResults,
+    ProjectVersions,
+    VersionLookupByHash,
+    LatestVersionsLookup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSettings {
+    pub game_versions: bool,
+    pub projects: bool,
+    pub search_results: bool,
+    pub project_versions: bool,
+    pub version_lookup_by_hash: bool,
+    pub latest_versions_lookup: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheStats {
     pub dir: PathBuf,
+    pub settings_path: PathBuf,
     pub max_bytes: u64,
     pub ttl: Duration,
     pub entry_count: usize,
     pub total_bytes: u64,
+    pub settings: CacheSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +63,7 @@ pub struct ModrinthClient {
     cache: ResponseCache,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub slug: String,
@@ -52,7 +74,7 @@ pub struct Project {
     pub downloads: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
     pub project_id: Option<String>,
     pub slug: String,
@@ -61,7 +83,7 @@ pub struct SearchHit {
     pub downloads: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {
     #[serde(rename = "id")]
     pub _id: String,
@@ -88,7 +110,7 @@ pub struct Version {
     pub files: Vec<VersionFile>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dependency {
     #[serde(rename = "version_id")]
     pub _version_id: Option<String>,
@@ -97,7 +119,7 @@ pub struct Dependency {
     pub dependency_type: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionFile {
     pub hashes: FileHashes,
     pub url: String,
@@ -106,7 +128,7 @@ pub struct VersionFile {
     pub file_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHashes {
     pub sha1: Option<String>,
     #[serde(rename = "sha512")]
@@ -134,8 +156,10 @@ struct GameVersionTag {
 #[derive(Debug, Clone)]
 struct ResponseCache {
     dir: PathBuf,
+    settings_path: PathBuf,
     max_bytes: u64,
     ttl: Duration,
+    settings: CacheSettings,
 }
 
 #[derive(Debug)]
@@ -143,6 +167,87 @@ struct CacheEntryInfo {
     path: PathBuf,
     modified: SystemTime,
     size: u64,
+}
+
+impl CacheKind {
+    pub const ALL: [Self; 6] = [
+        Self::GameVersions,
+        Self::Projects,
+        Self::SearchResults,
+        Self::ProjectVersions,
+        Self::VersionLookupByHash,
+        Self::LatestVersionsLookup,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GameVersions => "Game version tags",
+            Self::Projects => "Project metadata",
+            Self::SearchResults => "Search results",
+            Self::ProjectVersions => "Project versions",
+            Self::VersionLookupByHash => "Installed version lookups",
+            Self::LatestVersionsLookup => "Batch update lookups",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::GameVersions => "Reuse the Modrinth game-version tag index.",
+            Self::Projects => "Reuse project records fetched by slug or project id.",
+            Self::SearchResults => "Reuse repeated search result pages.",
+            Self::ProjectVersions => "Reuse compatible version lists for a project and environment.",
+            Self::VersionLookupByHash => "Reuse installed-jar hash lookups.",
+            Self::LatestVersionsLookup => "Reuse bulk update checks for installed hashes.",
+        }
+    }
+
+    fn file_prefix(self) -> &'static str {
+        match self {
+            Self::GameVersions => "game_versions",
+            Self::Projects => "projects",
+            Self::SearchResults => "search_results",
+            Self::ProjectVersions => "project_versions",
+            Self::VersionLookupByHash => "version_lookup_by_hash",
+            Self::LatestVersionsLookup => "latest_versions_lookup",
+        }
+    }
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            game_versions: true,
+            projects: true,
+            search_results: true,
+            project_versions: true,
+            version_lookup_by_hash: true,
+            latest_versions_lookup: true,
+        }
+    }
+}
+
+impl CacheSettings {
+    pub fn is_enabled(&self, kind: CacheKind) -> bool {
+        match kind {
+            CacheKind::GameVersions => self.game_versions,
+            CacheKind::Projects => self.projects,
+            CacheKind::SearchResults => self.search_results,
+            CacheKind::ProjectVersions => self.project_versions,
+            CacheKind::VersionLookupByHash => self.version_lookup_by_hash,
+            CacheKind::LatestVersionsLookup => self.latest_versions_lookup,
+        }
+    }
+
+    pub fn set_enabled(&mut self, kind: CacheKind, enabled: bool) {
+        match kind {
+            CacheKind::GameVersions => self.game_versions = enabled,
+            CacheKind::Projects => self.projects = enabled,
+            CacheKind::SearchResults => self.search_results = enabled,
+            CacheKind::ProjectVersions => self.project_versions = enabled,
+            CacheKind::VersionLookupByHash => self.version_lookup_by_hash = enabled,
+            CacheKind::LatestVersionsLookup => self.latest_versions_lookup = enabled,
+        }
+    }
 }
 
 impl ModrinthClient {
@@ -171,6 +276,7 @@ impl ModrinthClient {
 
     pub fn game_versions(&self) -> Result<Vec<String>> {
         let tags: Vec<GameVersionTag> = self.get_json_cached(
+            CacheKind::GameVersions,
             format!("{}/tag/game_version", self.base_url),
             "failed to fetch Modrinth game versions",
             "game versions request failed",
@@ -180,9 +286,18 @@ impl ModrinthClient {
         Ok(tags.into_iter().map(|tag| tag.version).collect())
     }
 
+    pub fn cached_game_versions(&self) -> Option<Vec<String>> {
+        let url = format!("{}/tag/game_version", self.base_url);
+        let cache_key = self.cache.key_for("GET", &url, None);
+        let bytes = self.cache.read(CacheKind::GameVersions, &cache_key)?;
+        let tags: Vec<GameVersionTag> = serde_json::from_slice(&bytes).ok()?;
+        Some(tags.into_iter().map(|tag| tag.version).collect())
+    }
+
     pub fn get_project(&self, id_or_slug: &str) -> Result<Option<Project>> {
         let url = format!("{}/project/{}", self.base_url, id_or_slug);
         self.get_optional_json_cached(
+            CacheKind::Projects,
             url,
             "failed to fetch project",
             "project request failed",
@@ -210,6 +325,7 @@ impl ModrinthClient {
         );
 
         let parsed: SearchResponse = self.get_json_cached(
+            CacheKind::SearchResults,
             url,
             "failed to search Modrinth",
             "Modrinth search failed",
@@ -234,6 +350,7 @@ impl ModrinthClient {
         );
 
         self.get_json_cached(
+            CacheKind::ProjectVersions,
             url,
             "failed to fetch project versions",
             "project versions request failed",
@@ -243,10 +360,8 @@ impl ModrinthClient {
 
     pub fn version_from_hash(&self, sha1: &str) -> Result<Option<Version>> {
         self.get_optional_json_cached(
-            format!(
-                "{}/version_file/{}?algorithm=sha1",
-                self.base_url, sha1
-            ),
+            CacheKind::VersionLookupByHash,
+            format!("{}/version_file/{}?algorithm=sha1", self.base_url, sha1),
             "failed to lookup installed mod by hash",
             "version-from-hash request failed",
             "failed to decode version-from-hash response",
@@ -270,6 +385,7 @@ impl ModrinthClient {
         };
 
         self.post_json_cached(
+            CacheKind::LatestVersionsLookup,
             format!("{}/version_files/update", self.base_url),
             &body,
             "failed to query latest versions from hashes",
@@ -295,8 +411,17 @@ impl ModrinthClient {
         self.cache.clear()
     }
 
+    pub fn cache_settings(&self) -> CacheSettings {
+        self.cache.settings()
+    }
+
+    pub fn save_cache_settings(&mut self, settings: CacheSettings) -> Result<()> {
+        self.cache.save_settings(settings)
+    }
+
     fn get_json_cached<T>(
         &self,
+        kind: CacheKind,
         url: String,
         fetch_context: &str,
         request_context: &str,
@@ -306,9 +431,8 @@ impl ModrinthClient {
         T: DeserializeOwned,
     {
         let cache_key = self.cache.key_for("GET", &url, None);
-        if let Some(bytes) = self.cache.read(&cache_key) {
-            return serde_json::from_slice(&bytes)
-                .with_context(|| decode_context.to_string());
+        if let Some(bytes) = self.cache.read(kind, &cache_key) {
+            return serde_json::from_slice(&bytes).with_context(|| decode_context.to_string());
         }
 
         let response = self
@@ -322,12 +446,13 @@ impl ModrinthClient {
             .bytes()
             .with_context(|| decode_context.to_string())?
             .to_vec();
-        self.cache.write(&cache_key, &bytes);
+        self.cache.write(kind, &cache_key, &bytes);
         serde_json::from_slice(&bytes).with_context(|| decode_context.to_string())
     }
 
     fn get_optional_json_cached<T>(
         &self,
+        kind: CacheKind,
         url: String,
         fetch_context: &str,
         request_context: &str,
@@ -337,7 +462,7 @@ impl ModrinthClient {
         T: DeserializeOwned,
     {
         let cache_key = self.cache.key_for("GET", &url, None);
-        if let Some(bytes) = self.cache.read(&cache_key) {
+        if let Some(bytes) = self.cache.read(kind, &cache_key) {
             return serde_json::from_slice(&bytes)
                 .map(Some)
                 .with_context(|| decode_context.to_string());
@@ -359,7 +484,7 @@ impl ModrinthClient {
             .bytes()
             .with_context(|| decode_context.to_string())?
             .to_vec();
-        self.cache.write(&cache_key, &bytes);
+        self.cache.write(kind, &cache_key, &bytes);
         serde_json::from_slice(&bytes)
             .map(Some)
             .with_context(|| decode_context.to_string())
@@ -367,6 +492,7 @@ impl ModrinthClient {
 
     fn post_json_cached<T, B>(
         &self,
+        kind: CacheKind,
         url: String,
         body: &B,
         fetch_context: &str,
@@ -379,9 +505,8 @@ impl ModrinthClient {
     {
         let body_bytes = serde_json::to_vec(body).context("failed to encode request body")?;
         let cache_key = self.cache.key_for("POST", &url, Some(&body_bytes));
-        if let Some(bytes) = self.cache.read(&cache_key) {
-            return serde_json::from_slice(&bytes)
-                .with_context(|| decode_context.to_string());
+        if let Some(bytes) = self.cache.read(kind, &cache_key) {
+            return serde_json::from_slice(&bytes).with_context(|| decode_context.to_string());
         }
 
         let response = self
@@ -396,13 +521,15 @@ impl ModrinthClient {
             .bytes()
             .with_context(|| decode_context.to_string())?
             .to_vec();
-        self.cache.write(&cache_key, &bytes);
+        self.cache.write(kind, &cache_key, &bytes);
         serde_json::from_slice(&bytes).with_context(|| decode_context.to_string())
     }
 }
 
 impl ResponseCache {
     fn from_env() -> Self {
+        let dir = default_cache_dir();
+        let settings_path = default_settings_path();
         let max_bytes = env::var("MODRINTH_CACHE_LIMIT_MB")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -414,24 +541,44 @@ impl ResponseCache {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_CACHE_TTL_SECS),
         );
+        let settings = Self::load_settings(&settings_path).unwrap_or_default();
 
-        Self::new(default_cache_dir(), max_bytes, ttl)
+        Self::new_with_settings_path(dir, settings_path, max_bytes, ttl, settings)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(dir: PathBuf, max_bytes: u64, ttl: Duration) -> Self {
-        Self {
-            dir,
+        Self::new_with_settings_path(
+            dir.clone(),
+            dir.join("cache-settings.json"),
             max_bytes,
             ttl,
+            CacheSettings::default(),
+        )
+    }
+
+    fn new_with_settings_path(
+        dir: PathBuf,
+        settings_path: PathBuf,
+        max_bytes: u64,
+        ttl: Duration,
+        settings: CacheSettings,
+    ) -> Self {
+        Self {
+            dir,
+            settings_path,
+            max_bytes,
+            ttl,
+            settings,
         }
     }
 
-    fn read(&self, key: &str) -> Option<Vec<u8>> {
-        if !self.is_enabled() {
+    fn read(&self, kind: CacheKind, key: &str) -> Option<Vec<u8>> {
+        if !self.is_enabled() || !self.settings.is_enabled(kind) {
             return None;
         }
 
-        let path = self.path_for(key);
+        let path = self.path_for(kind, key);
         let metadata = fs::metadata(&path).ok()?;
         let modified = metadata.modified().ok()?;
         if self.is_stale(modified) {
@@ -442,18 +589,18 @@ impl ResponseCache {
         fs::read(path).ok()
     }
 
-    fn write(&self, key: &str, bytes: &[u8]) {
-        let _ = self.write_inner(key, bytes);
+    fn write(&self, kind: CacheKind, key: &str, bytes: &[u8]) {
+        let _ = self.write_inner(kind, key, bytes);
     }
 
-    fn write_inner(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        if !self.is_enabled() {
+    fn write_inner(&self, kind: CacheKind, key: &str, bytes: &[u8]) -> Result<()> {
+        if !self.is_enabled() || !self.settings.is_enabled(kind) {
             return Ok(());
         }
 
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("failed to create cache directory {}", self.dir.display()))?;
-        let path = self.path_for(key);
+        let path = self.path_for(kind, key);
         let temp_path = path.with_extension("tmp");
         fs::write(&temp_path, bytes)
             .with_context(|| format!("failed to write cache file {}", temp_path.display()))?;
@@ -512,10 +659,12 @@ impl ResponseCache {
         let entries = self.entry_infos()?;
         Ok(CacheStats {
             dir: self.dir.clone(),
+            settings_path: self.settings_path.clone(),
             max_bytes: self.max_bytes,
             ttl: self.ttl,
             entry_count: entries.len(),
             total_bytes: entries.iter().map(|entry| entry.size).sum(),
+            settings: self.settings.clone(),
         })
     }
 
@@ -535,6 +684,23 @@ impl ResponseCache {
         })
     }
 
+    fn settings(&self) -> CacheSettings {
+        self.settings.clone()
+    }
+
+    fn save_settings(&mut self, settings: CacheSettings) -> Result<()> {
+        self.persist_settings(&settings)?;
+        self.settings = settings.clone();
+
+        for kind in CacheKind::ALL {
+            if !settings.is_enabled(kind) {
+                self.clear_kind(kind)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn key_for(&self, method: &str, url: &str, body: Option<&[u8]>) -> String {
         let mut hasher = Sha1::new();
         hasher.update(method.as_bytes());
@@ -547,8 +713,9 @@ impl ResponseCache {
         bytes_to_hex(&hasher.finalize())
     }
 
-    fn path_for(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.cache"))
+    fn path_for(&self, kind: CacheKind, key: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}-{key}.cache", kind.file_prefix()))
     }
 
     fn is_enabled(&self) -> bool {
@@ -560,32 +727,92 @@ impl ResponseCache {
             .duration_since(modified)
             .is_ok_and(|age| age > self.ttl)
     }
+
+    fn load_settings(path: &PathBuf) -> Option<CacheSettings> {
+        let bytes = fs::read(path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn persist_settings(&self, settings: &CacheSettings) -> Result<()> {
+        if let Some(parent) = self.settings_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create settings directory {}", parent.display())
+            })?;
+        }
+
+        let temp_path = self.settings_path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(settings).context("failed to encode cache settings")?;
+        fs::write(&temp_path, bytes)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        fs::rename(&temp_path, &self.settings_path)
+            .with_context(|| format!("failed to move {}", self.settings_path.display()))?;
+        Ok(())
+    }
+
+    fn clear_kind(&self, kind: CacheKind) -> Result<CacheClearResult> {
+        let prefix = format!("{}-", kind.file_prefix());
+        let entries: Vec<CacheEntryInfo> = self
+            .entry_infos()?
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        let removed_entries = entries.len();
+        let removed_bytes = entries.iter().map(|entry| entry.size).sum();
+
+        for entry in entries {
+            fs::remove_file(&entry.path)
+                .with_context(|| format!("failed to remove cache file {}", entry.path.display()))?;
+        }
+
+        Ok(CacheClearResult {
+            removed_entries,
+            removed_bytes,
+        })
+    }
 }
 
-fn default_cache_dir() -> PathBuf {
+pub fn app_cache_dir() -> PathBuf {
     if let Some(dir) = env::var_os("MODRINTH_CACHE_DIR") {
         return PathBuf::from(dir);
     }
 
     if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("modrinth-cli/http");
+        return PathBuf::from(dir).join("modrinth-cli");
     }
 
     #[cfg(target_os = "macos")]
     if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home).join("Library/Caches/modrinth-cli/http");
+        return PathBuf::from(home).join("Library/Caches/modrinth-cli");
     }
 
     #[cfg(target_os = "windows")]
     if let Some(dir) = env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(dir).join("modrinth-cli/http");
+        return PathBuf::from(dir).join("modrinth-cli");
     }
 
     if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache/modrinth-cli/http");
+        return PathBuf::from(home).join(".cache/modrinth-cli");
     }
 
-    env::temp_dir().join("modrinth-cli/http")
+    env::temp_dir().join("modrinth-cli")
+}
+
+fn default_cache_dir() -> PathBuf {
+    app_cache_dir().join("http")
+}
+
+fn default_settings_path() -> PathBuf {
+    if let Some(path) = env::var_os("MODRINTH_CACHE_SETTINGS_PATH") {
+        return PathBuf::from(path);
+    }
+
+    app_cache_dir().join("cache-settings.json")
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -748,12 +975,17 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(GET).path("/tag/game_version");
-            then.status(200).json_body(json!([{ "version": "1.21.11" }]));
+            then.status(200)
+                .json_body(json!([{ "version": "1.21.11" }]));
         });
         let temp_dir = tempdir().unwrap();
         let client = ModrinthClient::new_with_cache(
             server.base_url(),
-            ResponseCache::new(temp_dir.path().join("cache"), 1024 * 1024, Duration::from_secs(60)),
+            ResponseCache::new(
+                temp_dir.path().join("cache"),
+                1024 * 1024,
+                Duration::from_secs(60),
+            ),
         )
         .unwrap();
 
@@ -766,36 +998,69 @@ mod tests {
     }
 
     #[test]
+    fn cached_game_versions_reads_cached_tags_without_network() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/tag/game_version");
+            then.status(200)
+                .json_body(json!([{ "version": "1.21.11" }]));
+        });
+        let temp_dir = tempdir().unwrap();
+        let client = ModrinthClient::new_with_cache(
+            server.base_url(),
+            ResponseCache::new(
+                temp_dir.path().join("cache"),
+                1024 * 1024,
+                Duration::from_secs(60),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(client.game_versions().unwrap(), vec!["1.21.11"]);
+        assert_eq!(client.cached_game_versions().unwrap(), vec!["1.21.11"]);
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[test]
     fn cache_evicts_oldest_entries_when_over_limit() {
         let temp_dir = tempdir().unwrap();
-        let cache = ResponseCache::new(
-            temp_dir.path().join("cache"),
-            20,
-            Duration::from_secs(60),
+        let cache = ResponseCache::new(temp_dir.path().join("cache"), 20, Duration::from_secs(60));
+
+        cache
+            .write_inner(CacheKind::Projects, "oldest", b"1234567890")
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        cache
+            .write_inner(CacheKind::Projects, "middle", b"abcdefghij")
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        cache
+            .write_inner(CacheKind::Projects, "newest", b"ABCDEFGHIJ")
+            .unwrap();
+
+        assert!(cache.read(CacheKind::Projects, "oldest").is_none());
+        assert_eq!(
+            cache.read(CacheKind::Projects, "middle").unwrap(),
+            b"abcdefghij"
         );
-
-        cache.write_inner("oldest", b"1234567890").unwrap();
-        thread::sleep(Duration::from_millis(20));
-        cache.write_inner("middle", b"abcdefghij").unwrap();
-        thread::sleep(Duration::from_millis(20));
-        cache.write_inner("newest", b"ABCDEFGHIJ").unwrap();
-
-        assert!(cache.read("oldest").is_none());
-        assert_eq!(cache.read("middle").unwrap(), b"abcdefghij");
-        assert_eq!(cache.read("newest").unwrap(), b"ABCDEFGHIJ");
+        assert_eq!(
+            cache.read(CacheKind::Projects, "newest").unwrap(),
+            b"ABCDEFGHIJ"
+        );
     }
 
     #[test]
     fn cache_clear_removes_all_entries_and_reports_usage() {
         let temp_dir = tempdir().unwrap();
-        let cache = ResponseCache::new(
-            temp_dir.path().join("cache"),
-            1024,
-            Duration::from_secs(60),
-        );
+        let cache =
+            ResponseCache::new(temp_dir.path().join("cache"), 1024, Duration::from_secs(60));
 
-        cache.write_inner("one", b"12345").unwrap();
-        cache.write_inner("two", b"6789").unwrap();
+        cache
+            .write_inner(CacheKind::Projects, "one", b"12345")
+            .unwrap();
+        cache
+            .write_inner(CacheKind::SearchResults, "two", b"6789")
+            .unwrap();
 
         let stats = cache.stats().unwrap();
         assert_eq!(stats.entry_count, 2);
@@ -813,5 +1078,37 @@ mod tests {
         let stats = cache.stats().unwrap();
         assert_eq!(stats.entry_count, 0);
         assert_eq!(stats.total_bytes, 0);
+    }
+
+    #[test]
+    fn cache_settings_round_trip_and_disable_specific_kind() {
+        let temp_dir = tempdir().unwrap();
+        let settings_path = temp_dir.path().join("settings/cache-settings.json");
+        let mut cache = ResponseCache::new_with_settings_path(
+            temp_dir.path().join("cache"),
+            settings_path.clone(),
+            1024,
+            Duration::from_secs(60),
+            CacheSettings::default(),
+        );
+
+        cache
+            .write_inner(CacheKind::SearchResults, "search", b"12345")
+            .unwrap();
+        cache
+            .write_inner(CacheKind::Projects, "project", b"67890")
+            .unwrap();
+
+        let mut settings = cache.settings();
+        settings.set_enabled(CacheKind::SearchResults, false);
+        cache.save_settings(settings.clone()).unwrap();
+
+        let reloaded = ResponseCache::load_settings(&settings_path).unwrap();
+        assert_eq!(reloaded, settings);
+        assert!(cache.read(CacheKind::SearchResults, "search").is_none());
+        assert_eq!(
+            cache.read(CacheKind::Projects, "project").unwrap(),
+            b"67890"
+        );
     }
 }

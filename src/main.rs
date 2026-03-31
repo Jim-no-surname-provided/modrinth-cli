@@ -8,15 +8,16 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use minecraft::{DetectedEnvironment, GameVersionIndex, MinecraftContext};
-use modrinth::{CacheStats, ModrinthClient, Project, SearchHit, Version, VersionFile};
+use modrinth::{CacheKind, CacheStats, ModrinthClient, Project, SearchHit, Version, VersionFile};
 use search::{CandidateChoice, SearchCandidate, choose_best_match, rank_candidates};
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use tui::{DynamicInstallerOutcome, InstallerSelection, run_dynamic_installer};
+use tui::{DynamicInstallerOutcome, InstallerSelection, run_cache_settings_editor, run_dynamic_installer};
 
 const SEARCH_RESULT_LIMIT: usize = 5;
 
@@ -34,7 +35,7 @@ enum SearchSort {
     version,
     about = "Search, install, and update Modrinth mods",
     arg_required_else_help = true,
-    after_help = "Examples:\n  mod search sodium\n  mod s voice chat\n  mod search --downloads sodium\n  mod search --title sodium\n  mod search --global sodium\n  mod install sodium\n  mod install simple voice chat\n  mod dynamic-installer\n  mod update all\n  mod update sodium\n  mod cache\n  mod cache clear"
+    after_help = "Examples:\n  mod search sodium\n  mod s voice chat\n  mod search --downloads sodium\n  mod search --title sodium\n  mod search --global sodium\n  mod install sodium\n  mod install simple voice chat\n  mod tui\n  mod update all\n  mod update sodium\n  mod cache\n  mod cache clear\n  mod cache settings"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -50,7 +51,7 @@ enum Command {
     },
     #[command(
         name = "dynamic-installer",
-        alias = "di",
+        alias = "tui",
         about = "Open an interactive terminal UI for live search and multi-select install"
     )]
     DynamicInstaller,
@@ -107,6 +108,8 @@ enum Command {
 enum CacheCommand {
     #[command(about = "Delete all cached Modrinth API responses")]
     Clear,
+    #[command(about = "Open an interactive ratatui screen to choose what gets cached")]
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +125,39 @@ struct InstalledMod {
     project: Project,
 }
 
+#[derive(Debug, Clone)]
+struct InstalledJarMetadata {
+    path: PathBuf,
+    size: u64,
+    modified: FileStamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FileStamp {
+    secs_since_epoch: u64,
+    nanos_since_second: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct InstalledInventoryCache {
+    entries: Vec<InstalledInventoryCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstalledInventoryCacheEntry {
+    path: PathBuf,
+    size: u64,
+    modified: FileStamp,
+    resolved: Option<CachedInstalledMod>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedInstalledMod {
+    sha1: String,
+    version: Version,
+    project: Project,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error:#}");
@@ -132,16 +168,17 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir().context("failed to read current working directory")?;
-    let client = ModrinthClient::new_from_env()?;
-    let known_game_versions = client.game_versions().ok().map(GameVersionIndex::new);
+    let mut client = ModrinthClient::new_from_env()?;
     match cli.command {
         Command::Install { query } => {
             let query = join_words(query)?;
+            let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             install_from_query(&client, &context, &query)?;
         }
         Command::DynamicInstaller => {
+            let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             let installed = build_installed_inventory(&client, &context)?;
             match run_dynamic_installer(
@@ -154,12 +191,18 @@ fn run() -> Result<()> {
                 }
                 DynamicInstallerOutcome::Install(selections) => {
                     print_environment(&context.environment, &context.root_dir, &context.mods_dir);
-                    install_projects_from_selections(&client, &context, &selections)?;
+                    install_projects_from_selections_with_inventory(
+                        &client,
+                        &context,
+                        &selections,
+                        Some(installed),
+                    )?;
                 }
             }
         }
         Command::Update { target } => {
             let target = join_words(target)?;
+            let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             if target.eq_ignore_ascii_case("all") {
@@ -178,6 +221,7 @@ fn run() -> Result<()> {
         } => {
             let query = join_words(query)?;
             let sort = search_sort_from_flags(downloads, best_match, title, slug);
+            let known_game_versions = (!global).then(|| load_known_game_versions(&client)).flatten();
             print!(
                 "{}",
                 execute_search(
@@ -191,14 +235,21 @@ fn run() -> Result<()> {
             );
         }
         Command::Cache { command } => {
-            handle_cache_command(&client, command)?;
+            handle_cache_command(&mut client, command)?;
         }
     }
 
     Ok(())
 }
 
-fn handle_cache_command(client: &ModrinthClient, command: Option<CacheCommand>) -> Result<()> {
+fn load_known_game_versions(client: &ModrinthClient) -> Option<GameVersionIndex> {
+    client
+        .cached_game_versions()
+        .or_else(|| client.game_versions().ok())
+        .map(GameVersionIndex::new)
+}
+
+fn handle_cache_command(client: &mut ModrinthClient, command: Option<CacheCommand>) -> Result<()> {
     match command {
         None => {
             let stats = client.cache_stats()?;
@@ -210,10 +261,28 @@ fn handle_cache_command(client: &ModrinthClient, command: Option<CacheCommand>) 
             println!(
                 "Cleared {} cached response{} ({})",
                 cleared.removed_entries,
-                if cleared.removed_entries == 1 { "" } else { "s" },
+                if cleared.removed_entries == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 format_bytes(cleared.removed_bytes)
             );
             println!("Cache directory: {}", stats.dir.display());
+        }
+        Some(CacheCommand::Settings) => {
+            let initial = client.cache_settings();
+            match run_cache_settings_editor(&initial)? {
+                Some(updated) => {
+                    client.save_cache_settings(updated)?;
+                    let stats = client.cache_stats()?;
+                    println!("Saved cache settings.");
+                    println!("Settings file: {}", stats.settings_path.display());
+                }
+                None => {
+                    println!("Cache settings unchanged.");
+                }
+            }
         }
     }
 
@@ -234,13 +303,23 @@ fn install_from_query(
 ) -> Result<()> {
     let mut project_cache = HashMap::new();
     let project = resolve_project_query(client, &context.environment, query, &mut project_cache)?;
-    install_projects(client, context, vec![project], &mut project_cache)
+    install_projects(client, context, vec![project], None, &mut project_cache)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn install_projects_from_selections(
     client: &ModrinthClient,
     context: &MinecraftContext,
     selections: &[InstallerSelection],
+) -> Result<()> {
+    install_projects_from_selections_with_inventory(client, context, selections, None)
+}
+
+fn install_projects_from_selections_with_inventory(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    selections: &[InstallerSelection],
+    existing_inventory: Option<HashMap<String, InstalledMod>>,
 ) -> Result<()> {
     let mut project_cache = HashMap::new();
     let mut projects = Vec::with_capacity(selections.len());
@@ -257,16 +336,26 @@ fn install_projects_from_selections(
         projects.push(project);
     }
 
-    install_projects(client, context, projects, &mut project_cache)
+    install_projects(
+        client,
+        context,
+        projects,
+        existing_inventory,
+        &mut project_cache,
+    )
 }
 
 fn install_projects(
     client: &ModrinthClient,
     context: &MinecraftContext,
     projects: Vec<Project>,
+    existing_inventory: Option<HashMap<String, InstalledMod>>,
     project_cache: &mut HashMap<String, Project>,
 ) -> Result<()> {
-    let mut inventory = build_installed_inventory(client, context)?;
+    let mut inventory = match existing_inventory {
+        Some(existing_inventory) => existing_inventory,
+        None => build_installed_inventory(client, context)?,
+    };
 
     for project in projects {
         println!("Selected project: {} ({})", project.title, project.slug);
@@ -450,7 +539,10 @@ fn update_selected_project_if_installed(
         client.latest_versions_for_hashes(&[installed.jar.sha1.clone()], &context.environment)?;
 
     let Some(latest_version) = latest_by_hash.get(&installed.jar.sha1).cloned() else {
-        println!("No newer versions available for {}.", installed.project.title);
+        println!(
+            "No newer versions available for {}.",
+            installed.project.title
+        );
         return Ok(());
     };
 
@@ -469,7 +561,10 @@ fn update_selected_project_if_installed(
         .and_then(|file| file.sha1().map(|sha1| sha1.to_string()))
         .is_some_and(|latest_hash| latest_hash == installed.jar.sha1)
     {
-        println!("No newer versions available for {}.", installed.project.title);
+        println!(
+            "No newer versions available for {}.",
+            installed.project.title
+        );
         return Ok(());
     }
 
@@ -719,28 +814,63 @@ fn build_installed_inventory(
         .with_context(|| format!("failed to create {}", context.mods_dir.display()))?;
 
     let jars = scan_installed_jars(&context.mods_dir)?;
+    let cached_entries = read_installed_inventory_cache(&context.mods_dir)
+        .unwrap_or_default()
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<HashMap<_, _>>();
     let mut project_cache = HashMap::new();
     let mut installed = HashMap::new();
+    let mut next_cache_entries = Vec::with_capacity(jars.len());
 
     for jar in jars {
-        let Some(version) = client.version_from_hash(&jar.sha1)? else {
+        if let Some(cached_entry) = cached_entries
+            .get(&jar.path)
+            .filter(|entry| entry.matches(&jar))
+        {
+            next_cache_entries.push(cached_entry.clone());
+            if let Some(cached_mod) = cached_entry.resolved.as_ref() {
+                project_cache.insert(cached_mod.project.id.clone(), cached_mod.project.clone());
+                project_cache.insert(cached_mod.project.slug.clone(), cached_mod.project.clone());
+                installed.insert(
+                    cached_mod.project.id.clone(),
+                    cached_mod.to_installed_mod(jar.path.clone()),
+                );
+            }
             continue;
+        }
+
+        let sha1 = compute_sha1(&jar.path)?;
+        let resolved = match client.version_from_hash(&sha1)? {
+            Some(version) => fetch_project_cached(client, &mut project_cache, &version.project_id)?
+                .map(|project| CachedInstalledMod {
+                    sha1: sha1.clone(),
+                    version,
+                    project,
+                }),
+            None => None,
         };
 
-        let Some(project) = fetch_project_cached(client, &mut project_cache, &version.project_id)?
-        else {
-            continue;
-        };
+        next_cache_entries.push(InstalledInventoryCacheEntry::from_scan(
+            &jar,
+            resolved.clone(),
+        ));
 
-        installed.insert(
-            project.id.clone(),
-            InstalledMod {
-                jar,
-                version,
-                project,
-            },
-        );
+        if let Some(cached_mod) = resolved {
+            installed.insert(
+                cached_mod.project.id.clone(),
+                cached_mod.to_installed_mod(jar.path.clone()),
+            );
+        }
     }
+
+    let _ = write_installed_inventory_cache(
+        &context.mods_dir,
+        &InstalledInventoryCache {
+            entries: next_cache_entries,
+        },
+    );
 
     Ok(installed)
 }
@@ -777,7 +907,7 @@ fn build_installed_project_labels(
     labels
 }
 
-fn scan_installed_jars(mods_dir: &Path) -> Result<Vec<InstalledJar>> {
+fn scan_installed_jars(mods_dir: &Path) -> Result<Vec<InstalledJarMetadata>> {
     let mut jars = Vec::new();
     if !mods_dir.exists() {
         return Ok(jars);
@@ -792,9 +922,16 @@ fn scan_installed_jars(mods_dir: &Path) -> Result<Vec<InstalledJar>> {
             continue;
         }
 
-        jars.push(InstalledJar {
-            sha1: compute_sha1(&path)?,
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("failed to read modified time for {}", path.display()))?;
+        jars.push(InstalledJarMetadata {
             path,
+            size: metadata.len(),
+            modified: FileStamp::from_system_time(modified)?,
         });
     }
 
@@ -1130,13 +1267,30 @@ fn format_cache_stats(stats: &CacheStats) -> String {
     };
 
     format!(
-        "Cache directory: {}\nEntries: {}\nUsage: {} / {} ({usage_percent:.1}%)\nTTL: {}\nEviction: oldest files first when limit is exceeded\n",
+        "Cache directory: {}\nSettings file: {}\nEntries: {}\nUsage: {} / {} ({usage_percent:.1}%)\nTTL: {}\nEviction: oldest files first when limit is exceeded\n{}\n",
         stats.dir.display(),
+        stats.settings_path.display(),
         stats.entry_count,
         format_bytes(stats.total_bytes),
         format_bytes(stats.max_bytes),
         format_duration(stats.ttl),
+        format_cache_settings_summary(stats),
     )
+}
+
+fn format_cache_settings_summary(stats: &CacheStats) -> String {
+    let lines = CacheKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{} {}",
+                if stats.settings.is_enabled(*kind) { "[x]" } else { "[ ]" },
+                kind.label()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Cached endpoints:\n{lines}")
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1184,6 +1338,85 @@ fn bytes_to_hex(bytes: impl AsRef<[u8]>) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+impl FileStamp {
+    fn from_system_time(time: SystemTime) -> Result<Self> {
+        let duration = time
+            .duration_since(UNIX_EPOCH)
+            .context("file modified time predates unix epoch")?;
+        Ok(Self {
+            secs_since_epoch: duration.as_secs(),
+            nanos_since_second: duration.subsec_nanos(),
+        })
+    }
+}
+
+impl InstalledInventoryCacheEntry {
+    fn from_scan(scan: &InstalledJarMetadata, resolved: Option<CachedInstalledMod>) -> Self {
+        Self {
+            path: scan.path.clone(),
+            size: scan.size,
+            modified: scan.modified,
+            resolved,
+        }
+    }
+
+    fn matches(&self, scan: &InstalledJarMetadata) -> bool {
+        self.size == scan.size && self.modified == scan.modified
+    }
+}
+
+impl CachedInstalledMod {
+    fn to_installed_mod(&self, path: PathBuf) -> InstalledMod {
+        InstalledMod {
+            jar: InstalledJar {
+                path,
+                sha1: self.sha1.clone(),
+            },
+            version: self.version.clone(),
+            project: self.project.clone(),
+        }
+    }
+}
+
+fn read_installed_inventory_cache(mods_dir: &Path) -> Result<InstalledInventoryCache> {
+    let cache_path = installed_inventory_cache_path(mods_dir);
+    if !cache_path.exists() {
+        return Ok(InstalledInventoryCache::default());
+    }
+
+    let bytes = fs::read(&cache_path)
+        .with_context(|| format!("failed to read {}", cache_path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to decode {}", cache_path.display()))
+}
+
+fn write_installed_inventory_cache(mods_dir: &Path, cache: &InstalledInventoryCache) -> Result<()> {
+    let cache_path = installed_inventory_cache_path(mods_dir);
+    let parent = cache_path.parent().ok_or_else(|| {
+        anyhow!(
+            "inventory cache path {} had no parent directory",
+            cache_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let bytes = serde_json::to_vec(cache).context("failed to encode installed inventory cache")?;
+    let temp_path = cache_path.with_extension("tmp");
+    fs::write(&temp_path, &bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, &cache_path)
+        .with_context(|| format!("failed to move {}", cache_path.display()))
+}
+
+fn installed_inventory_cache_path(mods_dir: &Path) -> PathBuf {
+    let mut hasher = Sha1::new();
+    hasher.update(mods_dir.to_string_lossy().as_bytes());
+    let cache_key = bytes_to_hex(hasher.finalize());
+    modrinth::app_cache_dir()
+        .join("inventory")
+        .join(format!("{cache_key}.json"))
 }
 
 #[cfg(test)]
@@ -1739,9 +1972,10 @@ mod tests {
         assert!(help.contains("mod search --downloads sodium"));
         assert!(help.contains("mod search --title sodium"));
         assert!(help.contains("mod search --global sodium"));
-        assert!(help.contains("mod dynamic-installer"));
+        assert!(help.contains("mod tui"));
         assert!(help.contains("mod cache"));
         assert!(help.contains("mod cache clear"));
+        assert!(help.contains("mod cache settings"));
     }
 
     #[test]
@@ -1793,7 +2027,7 @@ mod tests {
 
     #[test]
     fn dynamic_installer_alias_parses() {
-        let cli = Cli::try_parse_from(["mod", "di"]).unwrap();
+        let cli = Cli::try_parse_from(["mod", "tui"]).unwrap();
         assert!(matches!(cli.command, Command::DynamicInstaller));
     }
 
@@ -1809,6 +2043,17 @@ mod tests {
     }
 
     #[test]
+    fn cache_settings_subcommand_parses() {
+        let cli = Cli::try_parse_from(["mod", "cache", "settings"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Cache {
+                command: Some(CacheCommand::Settings)
+            }
+        ));
+    }
+
+    #[test]
     fn cache_subcommand_help_mentions_clear() {
         let mut command = Cli::command();
         let help = command
@@ -1819,6 +2064,7 @@ mod tests {
 
         assert!(help.contains("Inspect or clear the local Modrinth API cache"));
         assert!(help.contains("clear"));
+        assert!(help.contains("settings"));
     }
 
     #[test]
@@ -1997,6 +2243,54 @@ mod tests {
     }
 
     #[test]
+    fn installed_inventory_cache_reuses_unchanged_jars() {
+        let temp = tempdir().unwrap();
+        write_fabric_root(temp.path());
+        let root = temp.path();
+        let context = MinecraftContext::discover(root).unwrap();
+        let cache_path = installed_inventory_cache_path(&context.mods_dir);
+        let _ = fs::remove_file(&cache_path);
+        let server = MockServer::start();
+
+        let current_bytes = b"cached-version";
+        let current_sha1 = bytes_to_hex(&Sha1::digest(current_bytes));
+        fs::write(root.join("mods/sodium.jar"), current_bytes).unwrap();
+
+        let version_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/version_file/{}", current_sha1))
+                .query_param("algorithm", "sha1");
+            then.status(200).json_body(mock_version(
+                "ver-current",
+                "proj-sodium",
+                "2.0.0",
+                "release",
+                &current_sha1,
+                "sodium.jar",
+                &server.url("/files/sodium-2.0.0.jar"),
+                json!([]),
+            ));
+        });
+
+        let project_mock = server.mock(|when, then| {
+            when.method(GET).path("/project/proj-sodium");
+            then.status(200)
+                .json_body(mock_project("proj-sodium", "sodium", "Sodium", 100000));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let first = build_installed_inventory(&client, &context).unwrap();
+        let second = build_installed_inventory(&client, &context).unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(version_mock.calls(), 1);
+        assert_eq!(project_mock.calls(), 1);
+
+        let _ = fs::remove_file(&cache_path);
+    }
+
+    #[test]
     fn dynamic_installer_batch_installs_multiple_selected_projects() {
         let temp = tempdir().unwrap();
         write_fabric_root(temp.path());
@@ -2103,7 +2397,7 @@ mod tests {
         let installed_path = root.join("mods/sodium.jar");
         fs::write(&installed_path, current_bytes).unwrap();
 
-        server.mock(|when, then| {
+        let version_from_hash_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!("/version_file/{}", current_sha1))
                 .query_param("algorithm", "sha1");
@@ -2147,7 +2441,8 @@ mod tests {
         });
 
         let client = ModrinthClient::new(server.base_url()).unwrap();
-        install_projects_from_selections(
+        let installed = build_installed_inventory(&client, &context).unwrap();
+        install_projects_from_selections_with_inventory(
             &client,
             &context,
             &[InstallerSelection {
@@ -2155,10 +2450,12 @@ mod tests {
                 slug: "sodium".to_string(),
                 title: "Sodium".to_string(),
             }],
+            Some(installed),
         )
         .unwrap();
 
         assert_eq!(compute_sha1(&installed_path).unwrap(), latest_sha1);
+        assert_eq!(version_from_hash_mock.calls(), 1);
     }
 
     #[test]

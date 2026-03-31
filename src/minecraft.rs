@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub struct MinecraftContext {
@@ -208,31 +207,19 @@ fn detect_quilt(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
     latest_environment(
-        WalkDir::new(root.join("libraries/org/quiltmc/quilt-loader"))
-            .max_depth(3)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .filter_map(|entry| {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                let loader_version = entry
-                    .path()
-                    .parent()?
-                    .file_name()?
-                    .to_string_lossy()
-                    .to_string();
-                let minecraft_version = parse_quilt_loader_library_jar(
-                    &file_name,
-                    &loader_version,
-                    known_game_versions,
-                )?;
-
+        detect_versioned_library_jars(
+            &root.join("libraries/org/quiltmc/quilt-loader"),
+            known_game_versions,
+            |file_name, parent_version, known_game_versions| {
+                let minecraft_version =
+                    parse_quilt_loader_library_jar(file_name, parent_version, known_game_versions)?;
                 Some(DetectedEnvironment {
                     loader: Loader::Quilt,
-                    loader_version: Some(loader_version),
+                    loader_version: Some(parent_version.to_string()),
                     minecraft_version,
                 })
-            }),
+            },
+        ),
         known_game_versions,
     )
 }
@@ -242,22 +229,12 @@ fn detect_forge(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
     latest_environment(
-        WalkDir::new(root.join("libraries/net/minecraftforge/forge"))
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_dir())
-            .filter_map(|entry| {
-                let folder = entry.file_name().to_string_lossy().to_string();
-                let (minecraft_version, loader_version) =
-                    parse_forge_directory(&folder, known_game_versions)?;
-
-                Some(DetectedEnvironment {
-                    loader: Loader::Forge,
-                    loader_version: Some(loader_version),
-                    minecraft_version,
-                })
-            }),
+        detect_loader_directories(
+            &root.join("libraries/net/minecraftforge/forge"),
+            known_game_versions,
+            Loader::Forge,
+            parse_forge_directory,
+        ),
         known_game_versions,
     )
 }
@@ -267,22 +244,12 @@ fn detect_neoforge(
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
     latest_environment(
-        WalkDir::new(root.join("libraries/net/neoforged/neoforge"))
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_dir())
-            .filter_map(|entry| {
-                let folder = entry.file_name().to_string_lossy().to_string();
-                let (minecraft_version, loader_version) =
-                    parse_neoforge_directory(&folder, known_game_versions)?;
-
-                Some(DetectedEnvironment {
-                    loader: Loader::NeoForge,
-                    loader_version: Some(loader_version),
-                    minecraft_version,
-                })
-            }),
+        detect_loader_directories(
+            &root.join("libraries/net/neoforged/neoforge"),
+            known_game_versions,
+            Loader::NeoForge,
+            parse_neoforge_directory,
+        ),
         known_game_versions,
     )
 }
@@ -471,22 +438,13 @@ fn detect_fabric_library_layout(
     let intermediary_version = detect_fabric_intermediary_version(root, known_game_versions);
 
     latest_environment(
-        WalkDir::new(root.join("libraries/net/fabricmc/fabric-loader"))
-            .max_depth(3)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .filter_map(|entry| {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                let parent_version = entry
-                    .path()
-                    .parent()?
-                    .file_name()?
-                    .to_string_lossy()
-                    .to_string();
+        detect_versioned_library_jars(
+            &root.join("libraries/net/fabricmc/fabric-loader"),
+            known_game_versions,
+            |file_name, parent_version, known_game_versions| {
                 let (loader_version, minecraft_version) = parse_fabric_loader_library_jar(
-                    &file_name,
-                    &parent_version,
+                    file_name,
+                    parent_version,
                     known_game_versions,
                 )?;
 
@@ -496,7 +454,8 @@ fn detect_fabric_library_layout(
                     minecraft_version: minecraft_version
                         .or_else(|| intermediary_version.clone())?,
                 })
-            }),
+            },
+        ),
         known_game_versions,
     )
 }
@@ -546,6 +505,67 @@ fn detect_fabric_intermediary_version(
         }),
         known_game_versions,
     )
+}
+
+fn detect_loader_directories(
+    base_dir: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+    loader: Loader,
+    parser: fn(&str, Option<&GameVersionIndex>) -> Option<(String, String)>,
+) -> impl Iterator<Item = DetectedEnvironment> {
+    fs::read_dir(base_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(move |entry| {
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+
+            let folder = entry.file_name().to_string_lossy().to_string();
+            let (minecraft_version, loader_version) = parser(&folder, known_game_versions)?;
+            Some(DetectedEnvironment {
+                loader: loader.clone(),
+                loader_version: Some(loader_version),
+                minecraft_version,
+            })
+        })
+}
+
+fn detect_versioned_library_jars<F>(
+    base_dir: &Path,
+    known_game_versions: Option<&GameVersionIndex>,
+    parser: F,
+) -> impl Iterator<Item = DetectedEnvironment>
+where
+    F: Fn(&str, &str, Option<&GameVersionIndex>) -> Option<DetectedEnvironment> + Copy,
+{
+    fs::read_dir(base_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(move |entry| {
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+
+            let parent_version = entry.file_name().to_string_lossy().to_string();
+            Some((parent_version, entry.path()))
+        })
+        .flat_map(move |(parent_version, dir_path)| {
+            fs::read_dir(dir_path)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+                .filter_map(move |entry| {
+                    if !entry.file_type().ok()?.is_file() {
+                        return None;
+                    }
+
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    parser(&file_name, &parent_version, known_game_versions)
+                })
+        })
 }
 
 fn parse_root_fabric_server_jar(file_name: &str) -> Option<(String, String)> {
