@@ -128,7 +128,12 @@ fn run() -> Result<()> {
         }
         Command::DynamicInstaller => {
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
-            match run_dynamic_installer(&client, &context.environment)? {
+            let installed = build_installed_inventory(&client, &context)?;
+            match run_dynamic_installer(
+                &client,
+                &context.environment,
+                build_installed_project_labels(&installed),
+            )? {
                 DynamicInstallerOutcome::Cancelled => {
                     println!("Dynamic installer cancelled.");
                 }
@@ -356,7 +361,19 @@ fn install_project_recursive(
         return Ok(());
     }
 
-    let prefix = "  ".repeat(depth);
+    if let Some(installed) = inventory.get(&project.id).cloned() {
+        update_selected_project_if_installed(
+            client,
+            context,
+            &installed,
+            inventory,
+            project_cache,
+            visited,
+            depth,
+        )?;
+        return Ok(());
+    }
+
     let versions = client.project_versions(&project.id, &context.environment)?;
     let version = select_version_for_environment(versions).with_context(|| {
         format!(
@@ -364,6 +381,95 @@ fn install_project_recursive(
             project.title, context.environment.loader, context.environment.minecraft_version
         )
     })?;
+
+    install_required_dependencies(
+        client,
+        context,
+        &version,
+        inventory,
+        project_cache,
+        visited,
+        depth,
+    )?;
+
+    let installed = inventory.get(&project.id).cloned();
+    install_selected_version(client, context, project, version, installed, inventory)?;
+    Ok(())
+}
+
+fn update_selected_project_if_installed(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    installed: &InstalledMod,
+    inventory: &mut HashMap<String, InstalledMod>,
+    project_cache: &mut HashMap<String, Project>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    let latest_by_hash =
+        client.latest_versions_for_hashes(&[installed.jar.sha1.clone()], &context.environment)?;
+
+    let Some(latest_version) = latest_by_hash.get(&installed.jar.sha1).cloned() else {
+        println!("No newer versions available for {}.", installed.project.title);
+        return Ok(());
+    };
+
+    install_required_dependencies(
+        client,
+        context,
+        &latest_version,
+        inventory,
+        project_cache,
+        visited,
+        depth,
+    )?;
+
+    if latest_version
+        .primary_download_file()
+        .and_then(|file| file.sha1().map(|sha1| sha1.to_string()))
+        .is_some_and(|latest_hash| latest_hash == installed.jar.sha1)
+    {
+        println!("No newer versions available for {}.", installed.project.title);
+        return Ok(());
+    }
+
+    if replace_if_newer(client, context, installed, &latest_version)? {
+        let latest_file = latest_version.primary_download_file().ok_or_else(|| {
+            anyhow!(
+                "latest version {} for {} has no downloadable jar",
+                latest_version.version_number,
+                installed.project.title
+            )
+        })?;
+        let expected_sha1 = latest_file
+            .sha1()
+            .ok_or_else(|| anyhow!("downloaded file metadata was missing sha1"))?;
+        inventory.insert(
+            installed.project.id.clone(),
+            InstalledMod {
+                jar: InstalledJar {
+                    path: context.mods_dir.join(&latest_file.filename),
+                    sha1: expected_sha1.to_string(),
+                },
+                version: latest_version,
+                project: installed.project.clone(),
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn install_required_dependencies(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    version: &Version,
+    inventory: &mut HashMap<String, InstalledMod>,
+    project_cache: &mut HashMap<String, Project>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Result<()> {
+    let prefix = "  ".repeat(depth);
 
     for dependency in version.required_dependencies() {
         if let Some(project_id) = dependency.project_id.clone() {
@@ -398,8 +504,6 @@ fn install_project_recursive(
         }
     }
 
-    let installed = inventory.get(&project.id).cloned();
-    install_selected_version(client, context, project, version, installed, inventory)?;
     Ok(())
 }
 
@@ -617,6 +721,20 @@ fn fetch_project_cached(
     cache.insert(project.id.clone(), project.clone());
     cache.insert(project.slug.clone(), project.clone());
     Ok(Some(project))
+}
+
+fn build_installed_project_labels(
+    installed: &HashMap<String, InstalledMod>,
+) -> HashMap<String, String> {
+    let mut labels = HashMap::with_capacity(installed.len() * 2);
+
+    for item in installed.values() {
+        let label = format!("Already downloaded ({})", item.version.version_number);
+        labels.insert(item.project.id.clone(), label.clone());
+        labels.insert(item.project.slug.clone(), label);
+    }
+
+    labels
 }
 
 fn scan_installed_jars(mods_dir: &Path) -> Result<Vec<InstalledJar>> {
@@ -1846,5 +1964,144 @@ mod tests {
             compute_sha1(&root.join("mods/iris.jar")).unwrap(),
             iris_sha1
         );
+    }
+
+    #[test]
+    fn dynamic_installer_selection_checks_updates_for_installed_mods() {
+        let temp = tempdir().unwrap();
+        write_fabric_root(temp.path());
+        let root = temp.path();
+        let context = MinecraftContext::discover(root).unwrap();
+        let server = MockServer::start();
+
+        let current_bytes = b"current-version";
+        let current_sha1 = bytes_to_hex(&Sha1::digest(current_bytes));
+        let latest_bytes = b"latest-version";
+        let latest_sha1 = bytes_to_hex(&Sha1::digest(latest_bytes));
+        let installed_path = root.join("mods/sodium.jar");
+        fs::write(&installed_path, current_bytes).unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/version_file/{}", current_sha1))
+                .query_param("algorithm", "sha1");
+            then.status(200).json_body(mock_version(
+                "ver-old",
+                "proj-sodium",
+                "1.0.0",
+                "release",
+                &current_sha1,
+                "sodium.jar",
+                &server.url("/files/sodium-1.0.0.jar"),
+                json!([]),
+            ));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/project/proj-sodium");
+            then.status(200)
+                .json_body(mock_project("proj-sodium", "sodium", "Sodium", 100000));
+        });
+
+        server.mock(|when, then| {
+            when.method(POST).path("/version_files/update");
+            then.status(200).json_body(json!({
+                current_sha1.clone(): mock_version(
+                    "ver-new",
+                    "proj-sodium",
+                    "2.0.0",
+                    "release",
+                    &latest_sha1,
+                    "sodium.jar",
+                    &server.url("/files/sodium-2.0.0.jar"),
+                    json!([])
+                )
+            }));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/files/sodium-2.0.0.jar");
+            then.status(200).body(latest_bytes);
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        install_projects_from_selections(
+            &client,
+            &context,
+            &[InstallerSelection {
+                lookup_key: "proj-sodium".to_string(),
+                slug: "sodium".to_string(),
+                title: "Sodium".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(compute_sha1(&installed_path).unwrap(), latest_sha1);
+    }
+
+    #[test]
+    fn dynamic_installer_selection_reports_no_newer_versions_for_current_mods() {
+        let temp = tempdir().unwrap();
+        write_fabric_root(temp.path());
+        let root = temp.path();
+        let context = MinecraftContext::discover(root).unwrap();
+        let server = MockServer::start();
+
+        let current_bytes = b"current-version";
+        let current_sha1 = bytes_to_hex(&Sha1::digest(current_bytes));
+        let installed_path = root.join("mods/sodium.jar");
+        fs::write(&installed_path, current_bytes).unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/version_file/{}", current_sha1))
+                .query_param("algorithm", "sha1");
+            then.status(200).json_body(mock_version(
+                "ver-current",
+                "proj-sodium",
+                "2.0.0",
+                "release",
+                &current_sha1,
+                "sodium.jar",
+                &server.url("/files/sodium-2.0.0.jar"),
+                json!([]),
+            ));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET).path("/project/proj-sodium");
+            then.status(200)
+                .json_body(mock_project("proj-sodium", "sodium", "Sodium", 100000));
+        });
+
+        server.mock(|when, then| {
+            when.method(POST).path("/version_files/update");
+            then.status(200).json_body(json!({
+                current_sha1.clone(): mock_version(
+                    "ver-current",
+                    "proj-sodium",
+                    "2.0.0",
+                    "release",
+                    &current_sha1,
+                    "sodium.jar",
+                    &server.url("/files/sodium-2.0.0.jar"),
+                    json!([])
+                )
+            }));
+        });
+
+        let client = ModrinthClient::new(server.base_url()).unwrap();
+        install_projects_from_selections(
+            &client,
+            &context,
+            &[InstallerSelection {
+                lookup_key: "proj-sodium".to_string(),
+                slug: "sodium".to_string(),
+                title: "Sodium".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(compute_sha1(&installed_path).unwrap(), current_sha1);
     }
 }

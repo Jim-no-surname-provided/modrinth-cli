@@ -44,6 +44,7 @@ struct SearchResult {
     slug: String,
     title: String,
     downloads: u64,
+    installed_label: Option<String>,
 }
 
 struct SearchUpdate {
@@ -54,9 +55,10 @@ struct SearchUpdate {
 pub fn run_dynamic_installer(
     client: &ModrinthClient,
     environment: &DetectedEnvironment,
+    installed_project_labels: HashMap<String, String>,
 ) -> Result<DynamicInstallerOutcome> {
     let mut terminal = ratatui::try_init()?;
-    let result = run_app(&mut terminal, client, environment);
+    let result = run_app(&mut terminal, client, environment, installed_project_labels);
     ratatui::try_restore()?;
     result
 }
@@ -65,8 +67,9 @@ fn run_app(
     terminal: &mut DefaultTerminal,
     client: &ModrinthClient,
     environment: &DetectedEnvironment,
+    installed_project_labels: HashMap<String, String>,
 ) -> Result<DynamicInstallerOutcome> {
-    let mut app = DynamicInstallerApp::new(client, environment);
+    let mut app = DynamicInstallerApp::new(client, environment, installed_project_labels);
 
     loop {
         app.tick();
@@ -100,6 +103,7 @@ struct DynamicInstallerApp<'a> {
     list_state: ListState,
     status: String,
     search_cache: HashMap<String, Vec<SearchResult>>,
+    installed_project_labels: HashMap<String, String>,
     in_flight_queries: HashSet<String>,
     pending_query: Option<String>,
     search_tx: Sender<SearchUpdate>,
@@ -108,7 +112,11 @@ struct DynamicInstallerApp<'a> {
 }
 
 impl<'a> DynamicInstallerApp<'a> {
-    fn new(client: &'a ModrinthClient, environment: &'a DetectedEnvironment) -> Self {
+    fn new(
+        client: &'a ModrinthClient,
+        environment: &'a DetectedEnvironment,
+        installed_project_labels: HashMap<String, String>,
+    ) -> Self {
         let (search_tx, search_rx) = mpsc::channel();
         Self {
             client,
@@ -120,6 +128,7 @@ impl<'a> DynamicInstallerApp<'a> {
             list_state: ListState::default(),
             status: default_status().to_string(),
             search_cache: HashMap::new(),
+            installed_project_labels,
             in_flight_queries: HashSet::new(),
             pending_query: None,
             search_tx,
@@ -257,6 +266,7 @@ impl<'a> DynamicInstallerApp<'a> {
 
         let client = self.client.clone();
         let environment = self.environment.clone();
+        let installed_project_labels = self.installed_project_labels.clone();
         let worker_query = query.clone();
         let tx = self.search_tx.clone();
         self.in_flight_queries.insert(query);
@@ -264,7 +274,13 @@ impl<'a> DynamicInstallerApp<'a> {
         thread::spawn(move || {
             let result = client
                 .search_projects(&worker_query, Some(&environment))
-                .map(|hits| rank_search_hits(&worker_query, &hits))
+                .map(|hits| {
+                    rank_search_hits_with_installed(
+                        &worker_query,
+                        &hits,
+                        &installed_project_labels,
+                    )
+                })
                 .map_err(|error| error.to_string());
             let _ = tx.send(SearchUpdate {
                 query: worker_query,
@@ -493,7 +509,7 @@ impl<'a> DynamicInstallerApp<'a> {
                 .map(|result| {
                     let is_selected = self.is_selected(&result.lookup_key);
                     let marker = if is_selected { "[x]" } else { "[ ]" };
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(
                             format!("{marker} "),
                             Style::default().fg(if is_selected {
@@ -516,7 +532,12 @@ impl<'a> DynamicInstallerApp<'a> {
                             format!("{} downloads", format_download_count(result.downloads)),
                             Style::default().fg(Color::DarkGray),
                         ),
-                    ]))
+                    ];
+                    if let Some(label) = result.installed_label.as_deref() {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(label, Style::default().fg(Color::Green)));
+                    }
+                    ListItem::new(Line::from(spans))
                 })
                 .collect();
 
@@ -662,7 +683,11 @@ fn default_status() -> &'static str {
     "Type a mod name to search. Press Tab to switch panes, Space to pick mods, Enter to install, and Esc to cancel."
 }
 
-fn rank_search_hits(query: &str, hits: &[SearchHit]) -> Vec<SearchResult> {
+fn rank_search_hits_with_installed(
+    query: &str,
+    hits: &[SearchHit],
+    installed_project_labels: &HashMap<String, String>,
+) -> Vec<SearchResult> {
     let mut hits_by_key = hits
         .iter()
         .map(|hit| {
@@ -688,12 +713,28 @@ fn rank_search_hits(query: &str, hits: &[SearchHit]) -> Vec<SearchResult> {
         .filter_map(|candidate| {
             hits_by_key.remove(&candidate.key).map(|hit| SearchResult {
                 lookup_key: candidate.key,
+                installed_label: lookup_installed_label(
+                    installed_project_labels,
+                    hit.project_id.as_deref(),
+                    &hit.slug,
+                ),
                 slug: hit.slug,
                 title: hit.title,
                 downloads: hit.downloads,
             })
         })
         .collect()
+}
+
+fn lookup_installed_label(
+    installed_project_labels: &HashMap<String, String>,
+    project_id: Option<&str>,
+    slug: &str,
+) -> Option<String> {
+    project_id
+        .and_then(|id| installed_project_labels.get(id))
+        .or_else(|| installed_project_labels.get(slug))
+        .cloned()
 }
 
 fn format_download_count(downloads: u64) -> String {
@@ -743,7 +784,7 @@ mod tests {
             },
         ];
 
-        let ranked = rank_search_hits("shulker tooltips", &hits);
+        let ranked = rank_search_hits_with_installed("shulker tooltips", &hits, &HashMap::new());
 
         assert_eq!(ranked[0].slug, "shulkerboxtooltips");
         assert_eq!(ranked[1].slug, "tooltipfix");
@@ -754,7 +795,7 @@ mod tests {
         let server = MockServer::start();
         let client = ModrinthClient::new(server.base_url()).unwrap();
         let environment = environment();
-        let mut app = DynamicInstallerApp::new(&client, &environment);
+        let mut app = DynamicInstallerApp::new(&client, &environment, HashMap::new());
         app.search_cache.insert(
             "sod".to_string(),
             vec![
@@ -763,12 +804,14 @@ mod tests {
                     slug: "sodium-extra".to_string(),
                     title: "Sodium Extra".to_string(),
                     downloads: 200_000,
+                    installed_label: None,
                 },
                 SearchResult {
                     lookup_key: "2".to_string(),
                     slug: "sodium".to_string(),
                     title: "Sodium".to_string(),
                     downloads: 100_000,
+                    installed_label: None,
                 },
             ],
         );
@@ -791,7 +834,7 @@ mod tests {
 
         let client = ModrinthClient::new(server.base_url()).unwrap();
         let environment = environment();
-        let mut app = DynamicInstallerApp::new(&client, &environment);
+        let mut app = DynamicInstallerApp::new(&client, &environment, HashMap::new());
         app.in_flight_queries.insert("sod".to_string());
         app.pending_query = Some("sodium".to_string());
         app.last_query_edit_at = Some(Instant::now() - SEARCH_DEBOUNCE);
@@ -808,13 +851,14 @@ mod tests {
         let server = MockServer::start();
         let client = ModrinthClient::new(server.base_url()).unwrap();
         let environment = environment();
-        let mut app = DynamicInstallerApp::new(&client, &environment);
+        let mut app = DynamicInstallerApp::new(&client, &environment, HashMap::new());
         app.query = "sodium extra".to_string();
         app.results = vec![SearchResult {
             lookup_key: "live".to_string(),
             slug: "sodium-extra".to_string(),
             title: "Sodium Extra".to_string(),
             downloads: 200_000,
+            installed_label: None,
         }];
 
         app.search_tx
@@ -825,6 +869,7 @@ mod tests {
                     slug: "sodium".to_string(),
                     title: "Sodium".to_string(),
                     downloads: 100_000,
+                    installed_label: None,
                 }]),
             })
             .unwrap();
@@ -833,5 +878,26 @@ mod tests {
         assert_eq!(app.results[0].slug, "sodium");
         assert!(app.search_cache.contains_key("sodium"));
         assert!(app.status.contains("Using cached `sodium` results"));
+    }
+
+    #[test]
+    fn ranking_marks_results_that_are_already_downloaded() {
+        let hits = vec![SearchHit {
+            project_id: Some("proj-sodium".to_string()),
+            slug: "sodium".to_string(),
+            title: "Sodium".to_string(),
+            downloads: 100_000,
+        }];
+        let installed = HashMap::from([(
+            "proj-sodium".to_string(),
+            "Already downloaded (2.0.0)".to_string(),
+        )]);
+
+        let ranked = rank_search_hits_with_installed("sodium", &hits, &installed);
+
+        assert_eq!(
+            ranked[0].installed_label.as_deref(),
+            Some("Already downloaded (2.0.0)")
+        );
     }
 }
