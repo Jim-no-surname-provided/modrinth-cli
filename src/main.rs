@@ -228,6 +228,7 @@ fn run() -> Result<()> {
             let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
+            println!();
             list_mods(&client, &context)?;
         }
         Command::Update { target } => {
@@ -547,15 +548,32 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
     }
     let latest = client.latest_versions_for_hashes(&hashes, &context.environment)?;
 
-    println!(
-        "{:<name_width$} | {:<version_width$} | Update available",
-        "Mod", "Version"
-    );
-    println!(
-        "{}-+-{}-+-----------------",
-        "-".repeat(name_width),
-        "-".repeat(version_width)
-    );
+    // Color the borders without changing the table text
+    let (gray, foreground) = if env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
+        ("\x1b[90m", "\x1b[39m")
+    } else {
+        ("", "")
+    };
+    let edge = format!("{gray}│{foreground}");
+    let update_heading = "Update?";
+    let update_width = update_heading.len();
+    let name_rule = "─".repeat(name_width + 2);
+    let version_rule = "─".repeat(version_width + 2);
+    let update_rule = "─".repeat(update_width + 2);
+
+    // Use the same column widths for the borders and rows
+    let print_rule = |left, joint, right| {
+        println!("{gray}{left}{name_rule}{joint}{version_rule}{joint}{update_rule}{right}{foreground}");
+    };
+    let print_row = |name: &str, version: &str, update: &str| {
+        println!(
+            "{edge} {name:<name_width$} {edge} {version:<version_width$} {edge} {update:<update_width$} {edge}"
+        );
+    };
+
+    print_rule('┌', '┬', '┐');
+    print_row("Mod", "Version", update_heading);
+    print_rule('├', '┼', '┤');
     let mut update_count = 0;
     for entry in mods {
         if let Some(item) = entry.resolved {
@@ -564,20 +582,14 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
                 .is_some_and(|version| has_jar_update(&item.sha1, &item.version, version));
             let marker = if has_update { "⬇" } else { "" };
             update_count += usize::from(has_update);
-            println!(
-                "{:<name_width$} | {:<version_width$} | {marker}",
-                item.project.title, item.version.version_number
-            );
+            print_row(&item.project.title, &item.version.version_number, marker);
         } else {
             let name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
-            println!(
-                "{:<name_width$} | {:<version_width$} |",
-                name.to_string_lossy(),
-                "Unknown"
-            );
+            print_row(&name.to_string_lossy(), "Unknown", "");
         }
     }
 
+    print_rule('└', '┴', '┘');
     println!("\n{update_count} update(s) available.");
     Ok(())
 }
@@ -1441,23 +1453,23 @@ fn format_environment(
     root_dir: &Path,
     mods_dir: &Path,
 ) -> String {
-    match environment.loader_version.as_deref() {
-        Some(loader_version) => format!(
-            "Detected {} {} on Minecraft {}\nRoot: {}\nMods: {}\n",
-            environment.loader,
-            loader_version,
-            environment.minecraft_version,
-            root_dir.display(),
-            mods_dir.display()
-        ),
-        None => format!(
-            "Detected {} on Minecraft {}\nRoot: {}\nMods: {}\n",
-            environment.loader,
-            environment.minecraft_version,
-            root_dir.display(),
-            mods_dir.display()
-        ),
-    }
+    let loader = match environment.loader_version.as_deref() {
+        Some(version) => format!("{} {version}", environment.loader),
+        None => environment.loader.to_string(),
+    };
+
+    // Honor the user's terminal color preference
+    let (green, cyan, foreground) = if env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
+        ("\x1b[32m", "\x1b[36m", "\x1b[39m")
+    } else {
+        ("", "", "")
+    };
+    format!(
+        "Detected {green}{loader}{foreground} on {cyan}Minecraft {}{foreground}\nRoot: {}\nMods: {}\n",
+        environment.minecraft_version,
+        root_dir.display(),
+        mods_dir.display(),
+    )
 }
 
 fn format_download_count(downloads: u64) -> String {
