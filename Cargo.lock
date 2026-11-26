@@ -1541,7 +1541,6 @@ dependencies = [
  "strsim",
  "tempfile",
  "urlencoding",
- "walkdir",
 ]
 
 [[package]]
