@@ -252,16 +252,13 @@ fn run() -> Result<()> {
             sync_stable,
         } => {
             let target = join_words(target)?;
-            if sync_stable && !target.eq_ignore_ascii_case("all") {
-                bail!("--sync-stable requires `mod update all`");
-            }
             let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             if target.eq_ignore_ascii_case("all") {
                 update_all(&client, &context, include_prerelease, sync_stable)?;
             } else {
-                update_named(&client, &context, &target, include_prerelease)?;
+                update_named(&client, &context, &target, include_prerelease, sync_stable)?;
             }
         }
         Command::Search {
@@ -1101,6 +1098,7 @@ fn update_named(
     context: &MinecraftContext,
     query: &str,
     include_prerelease: bool,
+    sync_stable: bool,
 ) -> Result<()> {
     let installed = build_installed_inventory(client, context)?;
     if installed.is_empty() {
@@ -1148,12 +1146,23 @@ fn update_named(
     let latest_by_hash = client.latest_versions_for_hashes(
         &[item.jar.sha1.clone()],
         &context.environment,
-        Some(update_version_types(include_prerelease)),
+        Some(update_version_types(include_prerelease && !sync_stable)),
     )?;
 
     match latest_by_hash.get(&item.jar.sha1) {
         Some(latest_version) => {
-            replace_if_newer(client, context, &item, latest_version)?;
+            if sync_stable {
+                replace_mod_jar(client, context, &item, latest_version)?;
+            } else {
+                replace_if_newer(client, context, &item, latest_version)?;
+            }
+            Ok(())
+        }
+        None if sync_stable => {
+            println!(
+                "No compatible stable release found for {}. Kept the installed version.",
+                item.project.title,
+            );
             Ok(())
         }
         None => bail!(
@@ -3272,7 +3281,7 @@ mod tests {
         fs::write(&installed_path, current_bytes).unwrap();
         let selected: Version = serde_json::from_value(beta).unwrap();
         assert_eq!(prerelease_suffix(&selected), " (beta)");
-        update_named(&client, &context, "sodium", true).unwrap();
+        update_named(&client, &context, "sodium", true, false).unwrap();
         assert_eq!(compute_sha1(&installed_path).unwrap(), beta_sha1);
         beta_download.assert();
 
@@ -3296,6 +3305,15 @@ mod tests {
 
     #[test]
     fn sync_stable_upgrades_and_downgrades_to_compatible_releases() {
+        assert_sync_stable(false);
+    }
+
+    #[test]
+    fn named_sync_stable_changes_only_the_selected_mod() {
+        assert_sync_stable(true);
+    }
+
+    fn assert_sync_stable(named: bool) {
         let temp = tempdir().unwrap();
         let root = temp.path();
         write_fabric_root(root);
@@ -3345,13 +3363,20 @@ mod tests {
         );
         newer_version["date_published"] = json!("2026-03-29T00:00:00Z");
         let lookup = server.mock(|when, then| {
-            when.method(POST)
+            let request = when.method(POST)
                 .path("/version_files/update")
                 .body_includes(&hashes[0])
-                .body_includes(&hashes[1])
-                .body_includes(&hashes[2])
                 .body_includes(r#""version_types":["release"]"#);
-            then.json_body(json!({hashes[0].clone(): stable_version, hashes[2].clone(): newer_version}));
+            if named {
+                request.body_excludes(&hashes[1]).body_excludes(&hashes[2]);
+                then.json_body(json!({hashes[0].clone(): stable_version}));
+            } else {
+                request.body_includes(&hashes[1]).body_includes(&hashes[2]);
+                then.json_body(json!({
+                    hashes[0].clone(): stable_version,
+                    hashes[2].clone(): newer_version,
+                }));
+            }
         });
         let download = server.mock(|when, then| {
             when.method(GET).path("/files/sodium-stable.jar");
@@ -3366,11 +3391,27 @@ mod tests {
         let client = ModrinthClient::new_with_test_cache(
             server.base_url(), root.join("api-cache"),
         ).unwrap();
-        update_all(&client, &context, false, true).unwrap();
+        if named {
+            let missing = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/version_files/update")
+                    .body_includes(&hashes[1])
+                    .body_excludes(&hashes[0])
+                    .body_excludes(&hashes[2])
+                    .body_includes(r#""version_types":["release"]"#);
+                then.json_body(json!({}));
+            });
+            update_named(&client, &context, "sodium", false, true).unwrap();
+            update_named(&client, &context, "distant-horizons", false, true).unwrap();
+            missing.assert();
+            newer_download.assert_calls(0);
+        } else {
+            update_all(&client, &context, false, true).unwrap();
+            newer_download.assert();
+        }
 
         lookup.assert();
         download.assert();
-        newer_download.assert();
         assert!(!root.join("mods/sodium.jar").exists());
         assert_eq!(fs::read(root.join("mods/sodium-stable.jar")).unwrap(), stable);
         assert_eq!(
@@ -3379,7 +3420,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(root.join("mods/lithium.jar")).unwrap(),
-            newer_stable,
+            if named { b"installed release".as_slice() } else { newer_stable.as_slice() },
         );
     }
 
