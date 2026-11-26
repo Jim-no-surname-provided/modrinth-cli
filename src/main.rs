@@ -940,7 +940,8 @@ fn list_mods(
     )?;
 
     // Color the borders without changing the table text
-    let (gray, foreground) = if env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
+    let color_enabled = env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    let (gray, foreground) = if color_enabled {
         ("\x1b[90m", "\x1b[39m")
     } else {
         ("", "")
@@ -956,18 +957,29 @@ fn list_mods(
     let version_rule = "─".repeat(version_width + 2);
     let update_rule = "─".repeat(update_width + 2);
 
-    // Use the same column widths for the borders and rows
+    let channel_heading = "Channel";
+    let channel_width = channel_heading.len();
+    let channel_rule = "─".repeat(channel_width + 2);
+
+    // Keep the channel background inside its cell
     let print_rule = |left, joint, right| {
-        println!("{gray}{left}{update_rule}{joint}{name_rule}{joint}{version_rule}{right}{foreground}");
-    };
-    let print_row = |name: &str, version: &str, update: &str| {
         println!(
-            "{edge} {update:>update_width$} {edge} {name:<name_width$} {edge} {version:<version_width$} {edge}"
+            "{gray}{left}{update_rule}{joint}{name_rule}{joint}{version_rule}{joint}{channel_rule}{right}{foreground}"
+        );
+    };
+    let print_row = |name: &str, version: &str, update: &str, channel: &str, tint: &str| {
+        let (background, reset) = if color_enabled && !tint.is_empty() {
+            (tint, "\x1b[49m")
+        } else {
+            ("", "")
+        };
+        println!(
+            "{edge} {update:>update_width$} {edge} {name:<name_width$} {edge} {version:<version_width$} {edge}{background} {channel:<channel_width$} {reset}{edge}"
         );
     };
 
     print_rule('┌', '┬', '┐');
-    print_row("Mod", "Version", update_heading);
+    print_row("Mod", "Version", update_heading, channel_heading, "");
     print_rule('├', '┼', '┤');
     let mut update_count = 0;
     for entry in mods {
@@ -979,10 +991,22 @@ fn list_mods(
                 .map(|version| format!("⬇{}", prerelease_suffix(version)))
                 .unwrap_or_default();
             update_count += usize::from(update.is_some());
-            print_row(&item.project.title, &item.version.version_number, &marker);
+            let (channel, tint) = match item.version.version_type.as_str() {
+                "release" => ("Stable", "\x1b[48;2;90;135;100m"),
+                "beta" => ("Beta", "\x1b[48;2;144;125;65m"),
+                "alpha" => ("Alpha", "\x1b[48;2;151;100;104m"),
+                _ => ("Unknown", ""),
+            };
+            print_row(
+                &item.project.title,
+                &item.version.version_number,
+                &marker,
+                channel,
+                tint,
+            );
         } else {
             let name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
-            print_row(&name.to_string_lossy(), "Unknown", "");
+            print_row(&name.to_string_lossy(), "Unknown", "", "Unknown", "");
         }
     }
 
