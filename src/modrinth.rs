@@ -255,6 +255,17 @@ impl ModrinthClient {
         Self::new_with_cache(base_url, ResponseCache::from_env())
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_test_cache(base_url: String, cache_dir: PathBuf) -> Result<Self> {
+        // Give the test its own HTTP cache with the usual limits
+        let cache = ResponseCache::new(
+            cache_dir,
+            DEFAULT_CACHE_LIMIT_MB * MEGABYTE,
+            Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
+        );
+        Self::new_with_cache(base_url, cache)
+    }
+
     fn new_with_cache(base_url: String, cache: ResponseCache) -> Result<Self> {
         let http = Client::builder()
             .user_agent(format!("modrinth-cli/{}", env!("CARGO_PKG_VERSION")))
@@ -857,7 +868,7 @@ impl VersionFile {
         self.hashes.sha1.as_deref()
     }
 
-    fn is_downloadable_jar(&self) -> bool {
+    pub(crate) fn is_downloadable_jar(&self) -> bool {
         let not_auxiliary = !matches!(
             self.file_type.as_deref(),
             Some("sources-jar" | "dev-jar" | "javadoc-jar" | "signature")

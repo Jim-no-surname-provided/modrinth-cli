@@ -55,6 +55,8 @@ enum Command {
         about = "Open an interactive terminal UI for live search and multi-select install"
     )]
     DynamicInstaller,
+    #[command(about = "List installed mods and show available updates")]
+    List,
     #[command(alias = "u")]
     Update {
         #[arg(help = "Installed mod name, or `all` to update everything")]
@@ -199,6 +201,12 @@ fn run() -> Result<()> {
                     )?;
                 }
             }
+        }
+        Command::List => {
+            // Detect the Minecraft version and loader for the update check
+            let known_game_versions = load_known_game_versions(&client);
+            let context = discover_context(&cwd, known_game_versions.as_ref())?;
+            list_mods(&client, &context)?;
         }
         Command::Update { target } => {
             let target = join_words(target)?;
@@ -372,6 +380,71 @@ fn install_projects(
     }
 
     Ok(())
+}
+
+fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> {
+    // Scan once and check recognized jars for compatible updates
+    let mut mods = resolve_installed_jars(client, context)?;
+    mods.sort_by(|left, right| left.path.cmp(&right.path));
+    // Collect hashes for the update lookup and measure the table columns
+    let mut hashes = Vec::new();
+    let mut name_width = "Mod".len();
+    let mut version_width = "Version".len().max("Unknown".len());
+
+    for entry in &mods {
+        if let Some(item) = &entry.resolved {
+            hashes.push(item.sha1.clone());
+            name_width = name_width.max(item.project.title.chars().count());
+            version_width = version_width.max(item.version.version_number.chars().count());
+        } else {
+            let name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
+            name_width = name_width.max(name.to_string_lossy().chars().count());
+        }
+    }
+    let latest = client.latest_versions_for_hashes(&hashes, &context.environment)?;
+
+    // Print each row and count available updates as we go
+    println!(
+        "{:<name_width$} | {:<version_width$} | Update available",
+        "Mod", "Version"
+    );
+    println!(
+        "{}-+-{}-+-----------------",
+        "-".repeat(name_width),
+        "-".repeat(version_width)
+    );
+    let mut update_count = 0;
+    for entry in mods {
+        if let Some(item) = entry.resolved {
+            let has_update = latest
+                .get(&item.sha1)
+                .is_some_and(|version| has_jar_update(&item.sha1, &item.version, version));
+            let marker = if has_update { "⬇" } else { "" };
+            update_count += usize::from(has_update);
+            println!(
+                "{:<name_width$} | {:<version_width$} | {marker}",
+                item.project.title, item.version.version_number
+            );
+        } else {
+            let name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
+            println!(
+                "{:<name_width$} | {:<version_width$} |",
+                name.to_string_lossy(),
+                "Unknown"
+            );
+        }
+    }
+
+    println!("\n{update_count} update(s) available.");
+    Ok(())
+}
+
+fn has_jar_update(installed_sha1: &str, installed: &Version, latest: &Version) -> bool {
+    // Skip older releases and compare the hash of the jar the updater would pick
+    latest.date_published >= installed.date_published
+        && latest.primary_download_file().is_some_and(|file| {
+            file.is_downloadable_jar() && file.sha1().is_some_and(|hash| hash != installed_sha1)
+        })
 }
 
 fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> {
@@ -810,6 +883,21 @@ fn build_installed_inventory(
     client: &ModrinthClient,
     context: &MinecraftContext,
 ) -> Result<HashMap<String, InstalledMod>> {
+    // Keep one entry per project for install and update commands
+    let mut installed = HashMap::new();
+    for entry in resolve_installed_jars(client, context)? {
+        if let Some(item) = entry.resolved {
+            installed.insert(item.project.id.clone(), item.to_installed_mod(entry.path));
+        }
+    }
+    Ok(installed)
+}
+
+fn resolve_installed_jars(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+) -> Result<Vec<InstalledInventoryCacheEntry>> {
+    // Scan the mods directory and load previous lookups
     fs::create_dir_all(&context.mods_dir)
         .with_context(|| format!("failed to create {}", context.mods_dir.display()))?;
 
@@ -821,10 +909,10 @@ fn build_installed_inventory(
         .map(|entry| (entry.path.clone(), entry))
         .collect::<HashMap<_, _>>();
     let mut project_cache = HashMap::new();
-    let mut installed = HashMap::new();
     let mut next_cache_entries = Vec::with_capacity(jars.len());
 
     for jar in jars {
+        // Reuse lookups for jars that have stayed the same
         if let Some(cached_entry) = cached_entries
             .get(&jar.path)
             .filter(|entry| entry.matches(&jar))
@@ -833,14 +921,11 @@ fn build_installed_inventory(
             if let Some(cached_mod) = cached_entry.resolved.as_ref() {
                 project_cache.insert(cached_mod.project.id.clone(), cached_mod.project.clone());
                 project_cache.insert(cached_mod.project.slug.clone(), cached_mod.project.clone());
-                installed.insert(
-                    cached_mod.project.id.clone(),
-                    cached_mod.to_installed_mod(jar.path.clone()),
-                );
             }
             continue;
         }
 
+        // Look up new or changed jars by their file hash
         let sha1 = compute_sha1(&jar.path)?;
         let resolved = match client.version_from_hash(&sha1)? {
             Some(version) => fetch_project_cached(client, &mut project_cache, &version.project_id)?
@@ -852,27 +937,16 @@ fn build_installed_inventory(
             None => None,
         };
 
-        next_cache_entries.push(InstalledInventoryCacheEntry::from_scan(
-            &jar,
-            resolved.clone(),
-        ));
-
-        if let Some(cached_mod) = resolved {
-            installed.insert(
-                cached_mod.project.id.clone(),
-                cached_mod.to_installed_mod(jar.path.clone()),
-            );
-        }
+        next_cache_entries.push(InstalledInventoryCacheEntry::from_scan(&jar, resolved));
     }
 
-    let _ = write_installed_inventory_cache(
-        &context.mods_dir,
-        &InstalledInventoryCache {
-            entries: next_cache_entries,
-        },
-    );
+    // Save the scan and pass the same entries back to the caller
+    let cache = InstalledInventoryCache {
+        entries: next_cache_entries,
+    };
+    let _ = write_installed_inventory_cache(&context.mods_dir, &cache);
 
-    Ok(installed)
+    Ok(cache.entries)
 }
 
 fn fetch_project_cached(
@@ -1993,7 +2067,8 @@ mod tests {
             }));
         });
 
-        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let client =
+            ModrinthClient::new_with_test_cache(server.base_url(), temp.path().join("http")).unwrap();
         let output = execute_search(
             &client,
             temp.path(),
@@ -2178,6 +2253,36 @@ mod tests {
     }
 
     #[test]
+    fn list_updates_require_a_different_jar_without_going_back_in_time() {
+        // Start with two releases that contain the same jar
+        let installed: Version = serde_json::from_value(mock_version(
+            "installed",
+            "proj",
+            "1.0",
+            "release",
+            "installed-hash",
+            "mod.jar",
+            "https://example.com/mod.jar",
+            json!([]),
+        ))
+        .unwrap();
+        let mut latest = installed.clone();
+        latest.date_published = installed.date_published + chrono::Duration::days(1);
+        assert!(!has_jar_update("installed-hash", &installed, &latest));
+
+        // A different jar counts as an update unless its release is older
+        latest.files[0].hashes.sha1 = Some("different-hash".into());
+        assert!(has_jar_update("installed-hash", &installed, &latest));
+        latest.date_published = installed.date_published - chrono::Duration::days(1);
+        assert!(!has_jar_update("installed-hash", &installed, &latest));
+
+        // Skip releases whose jar has no hash to compare
+        latest.date_published = installed.date_published + chrono::Duration::days(1);
+        latest.files[0].hashes.sha1 = None;
+        assert!(!has_jar_update("installed-hash", &installed, &latest));
+    }
+
+    #[test]
     fn update_all_replaces_outdated_mods() {
         let temp = tempdir().unwrap();
         write_fabric_root(temp.path());
@@ -2278,8 +2383,11 @@ mod tests {
                 .json_body(mock_project("proj-sodium", "sodium", "Sodium", 100000));
         });
 
-        let client = ModrinthClient::new(server.base_url()).unwrap();
+        let client =
+            ModrinthClient::new_with_test_cache(server.base_url(), temp.path().join("http")).unwrap();
         let first = build_installed_inventory(&client, &context).unwrap();
+        // Clear the HTTP responses so the second scan has to reuse the inventory
+        client.clear_cache().unwrap();
         let second = build_installed_inventory(&client, &context).unwrap();
 
         assert_eq!(first.len(), 1);
