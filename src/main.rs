@@ -203,7 +203,7 @@ fn run() -> Result<()> {
             )? {
                 DynamicInstallerOutcome::Cancelled => {
                     println!("Dynamic installer cancelled.");
-                }
+                }   
                 DynamicInstallerOutcome::Install(selections) => {
                     print_environment(&context.environment, &context.root_dir, &context.mods_dir);
                     install_projects_from_selections_with_inventory(
@@ -230,6 +230,10 @@ fn run() -> Result<()> {
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             println!();
             list_mods(&client, &context)?;
+            println!();
+            if let Err(error) = check_loader(&context) {
+                eprintln!("Loader check failed: {error:#}");
+            }
         }
         Command::Update { target } => {
             let target = join_words(target)?;
@@ -438,18 +442,42 @@ fn check_loader(context: &MinecraftContext) -> Result<()> {
         Loader::Fabric | Loader::Quilt => release.stable,
     });
 
-    // Show both release choices and compare the installed version
-    println!("Installed {loader} on Minecraft {minecraft_version}: {installed}");
-    println!("Latest compatible: {}", latest.id);
+    // Compare release positions before choosing which versions to highlight
+    let installed_index = releases.iter().position(|release| release.id == installed);
+    let (cyan, green, yellow, foreground) =
+        if env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
+            ("\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[39m")
+        } else {
+            ("", "", "", "")
+        };
+    let format_release = |release: &LoaderRelease| {
+        let color = if release.id == installed {
+            green
+        } else if installed_index.is_some_and(|index| {
+            releases[..index].iter().any(|candidate| candidate.id == release.id)
+        }) {
+            yellow
+        } else {
+            ""
+        };
+        let reset = if color.is_empty() { "" } else { foreground };
+        format!("{color}{}{reset}", release.id)
+    };
+
+    // Highlight only the version values
+    let installed_version = format!("{green}{installed}{foreground}");
+    let latest_version = format_release(latest);
+    println!("Installed {loader} on Minecraft {cyan}{minecraft_version}{foreground}: {installed_version}");
+    println!("Latest compatible: {latest_version}");
     match stable {
-        Some(release) => println!("Latest stable: {}", release.id),
+        Some(release) => println!("Latest stable: {}", format_release(release)),
         None => println!("Latest stable: none listed"),
     }
 
-    match releases.iter().position(|release| release.id == installed) {
+    match installed_index {
         Some(0) => println!("No loader update available."),
-        Some(_) => println!("Loader update available: {installed} → {}", latest.id),
-        None => println!("The manifest does not list {installed}, so update status is unknown."),
+        Some(_) => println!("Loader update available: {installed_version} → {latest_version}"),
+        None => println!("The manifest does not list {installed_version}, so update status is unknown."),
     }
 
     Ok(())
