@@ -355,16 +355,11 @@ struct LoaderRelease {
     stable: bool,
 }
 
-fn check_loader(context: &MinecraftContext) -> Result<()> {
+fn compatible_loader_releases(
+    loader: &minecraft::Loader,
+    minecraft_version: &str,
+) -> Result<Vec<LoaderRelease>> {
     use minecraft::Loader;
-
-    let environment = &context.environment;
-    let loader = &environment.loader;
-    let minecraft_version = &environment.minecraft_version;
-    let installed = environment
-        .loader_version
-        .as_deref()
-        .with_context(|| format!("could not determine the installed {loader} version"))?;
 
     // Fetch the Modrinth manifest for the detected loader
     let path = match loader {
@@ -374,7 +369,7 @@ fn check_loader(context: &MinecraftContext) -> Result<()> {
         Loader::NeoForge => "neo/v0",
     };
     let url = format!("https://launcher-meta.modrinth.com/{path}/manifest.json");
-    let manifest: LoaderManifest = reqwest::blocking::Client::builder()
+    let mut manifest: LoaderManifest = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?
         .get(url)
@@ -388,32 +383,48 @@ fn check_loader(context: &MinecraftContext) -> Result<()> {
     // Find the exact Minecraft version before resolving shared loader lists
     let game = manifest
         .game_versions
-        .iter()
-        .find(|game| game.id == *minecraft_version)
+        .iter_mut()
+        .find(|game| game.id == minecraft_version)
         .with_context(|| format!("no {loader} entry for Minecraft {minecraft_version}"))?;
     let releases = match (loader, game.version_group.as_deref()) {
         (Loader::Quilt, Some(group_id)) => {
             let group = manifest
                 .version_groups
-                .iter()
+                .iter_mut()
                 .find(|group| group.id == group_id)
                 .with_context(|| format!("missing Quilt version group {group_id}"))?;
-            &group.loaders
+            &mut group.loaders
         }
         (Loader::Fabric, _) if game.loaders.is_empty() => {
             // Fabric can store universal releases in one shared entry
             let mut shared = manifest
                 .game_versions
-                .iter()
+                .iter_mut()
                 .filter(|entry| !entry.loaders.is_empty());
             let entry = shared.next().context("missing shared Fabric loader list")?;
             if shared.next().is_some() {
                 bail!("could not identify a unique shared Fabric loader list");
             }
-            &entry.loaders
+            &mut entry.loaders
         }
-        _ => &game.loaders,
+        _ => &mut game.loaders,
     };
+
+    Ok(std::mem::take(releases))
+}
+
+fn check_loader(context: &MinecraftContext) -> Result<()> {
+    use minecraft::Loader;
+
+    let environment = &context.environment;
+    let loader = &environment.loader;
+    let minecraft_version = &environment.minecraft_version;
+    let installed = environment
+        .loader_version
+        .as_deref()
+        .with_context(|| format!("could not determine the installed {loader} version"))?;
+
+    let releases = compatible_loader_releases(loader, minecraft_version)?;
 
     // Use manifest order and infer stable Forge releases from numeric version IDs
     let latest = releases.first().with_context(|| {
@@ -444,8 +455,115 @@ fn check_loader(context: &MinecraftContext) -> Result<()> {
     Ok(())
 }
 
-fn update_loader(_context: &MinecraftContext) -> Result<()> {
-    bail!("mod loader update is not implemented yet")
+fn update_loader(context: &MinecraftContext) -> Result<()> {
+    use minecraft::Loader;
+
+    match context.environment.loader {
+        Loader::Fabric => update_loader_fabric(context),
+        Loader::Quilt => update_loader_quilt(context),
+        Loader::Forge => update_loader_forge(context),
+        Loader::NeoForge => update_loader_neoforge(context),
+    }
+}
+
+fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
+    // Find the one executable launcher in the instance root
+    let mut launchers = Vec::new();
+    for entry in fs::read_dir(&context.root_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path.extension().is_some_and(|extension| extension == "jar")
+            && let Ok(environment) = minecraft::read_fabric_server_launcher(&path)
+        {
+            launchers.push((path, environment));
+        }
+    }
+    let [(launcher, environment)] = launchers.as_slice() else {
+        bail!("expected one executable Fabric launcher in {}, found {}", context.root_dir.display(), launchers.len());
+    };
+    let minecraft_version = &environment.minecraft_version;
+    if minecraft_version != &context.environment.minecraft_version {
+        bail!("the Fabric launcher targets Minecraft {minecraft_version}, but the detected instance targets {}", context.environment.minecraft_version);
+    }
+    let installed = environment
+        .loader_version
+        .as_deref()
+        .context("missing installed Fabric Loader version")?;
+
+    // Compare the installed version with the newest stable compatible release
+    let releases = compatible_loader_releases(&environment.loader, minecraft_version)?;
+    let Some(target_index) = releases.iter().position(|release| release.stable) else {
+        println!("No stable Fabric Loader release found for Minecraft {minecraft_version}.");
+        return Ok(());
+    };
+    let installed_index = releases
+        .iter()
+        .position(|release| release.id == installed)
+        .with_context(|| format!("could not compare installed Fabric Loader {installed} with the available releases"))?;
+    if target_index >= installed_index {
+        println!("No stable Fabric Loader update available for Minecraft {minecraft_version}.");
+        return Ok(());
+    }
+    let target = &releases[target_index].id;
+
+    // Download and check the new launcher before touching the old one
+    let game_segment = urlencoding::encode(minecraft_version);
+    let loader_segment = urlencoding::encode(target);
+    let url = format!("https://meta.fabricmc.net/v2/versions/loader/{game_segment}/{loader_segment}/stable/server/jar");
+    let mut response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?
+        .get(url)
+        .send()
+        .context("failed to download the Fabric launcher")?
+        .error_for_status()
+        .context("Fabric launcher download failed")?;
+    let mut download = tempfile::NamedTempFile::new_in(&context.root_dir)?;
+    response.copy_to(download.as_file_mut())?;
+    let downloaded = minecraft::read_fabric_server_launcher(download.path())
+        .context("downloaded file is not an executable Fabric server launcher")?;
+    if downloaded.minecraft_version != *minecraft_version
+        || downloaded.loader_version.as_deref() != Some(target.as_str())
+    {
+        bail!("downloaded Fabric launcher does not match Minecraft {minecraft_version} and Fabric Loader {target}");
+    }
+
+    // Back up the old launcher before replacing it at the same path
+    let current = File::open(launcher)?;
+    current.try_lock().context("could not lock the Fabric launcher for updating")?;
+    if minecraft::read_fabric_server_launcher(launcher)? != *environment {
+        bail!("the Fabric launcher changed while downloading the update");
+    }
+    download.as_file().set_permissions(current.metadata()?.permissions())?;
+    download.as_file().sync_all()?;
+    let mut backup_name = launcher.as_os_str().to_os_string();
+    backup_name.push(format!(".{installed}.bak"));
+    let backup = PathBuf::from(backup_name);
+    fs::hard_link(launcher, &backup)
+        .with_context(|| format!("could not back up the launcher to {}", backup.display()))?;
+    if let Err(error) = download.persist(launcher) {
+        fs::remove_file(&backup).with_context(|| {
+            format!("could not replace the launcher ({error}) or remove the unused backup {}", backup.display())
+        })?;
+        return Err(error).context("could not replace the Fabric launcher");
+    }
+
+    println!("Updated Fabric Loader {installed} → {target} for Minecraft {minecraft_version}.");
+    println!("Backup: {}", backup.display());
+    Ok(())
+}
+
+fn update_loader_quilt(_context: &MinecraftContext) -> Result<()> {
+    bail!("Quilt loader updates are not implemented yet")
+}
+
+fn update_loader_forge(_context: &MinecraftContext) -> Result<()> {
+    bail!("Forge loader updates are not implemented yet")
+}
+
+fn update_loader_neoforge(_context: &MinecraftContext) -> Result<()> {
+    bail!("NeoForge loader updates are not implemented yet")
 }
 
 fn install_from_query(

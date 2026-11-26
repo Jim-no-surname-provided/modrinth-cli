@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -375,6 +376,31 @@ fn looks_like_loader_version(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+'))
 }
 
+pub fn read_fabric_server_launcher(path: &Path) -> Result<DetectedEnvironment> {
+    // Fabric embeds the selected versions in the executable launcher
+    let mut jar = zip::ZipArchive::new(fs::File::open(path)?)?;
+    let mut properties = String::new();
+    jar.by_name("install.properties")?
+        .take(4096)
+        .read_to_string(&mut properties)?;
+    let property = |key| {
+        properties
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(name, value)| (name == key && !value.is_empty()).then_some(value))
+    };
+    let minecraft_version = property("game-version").context("missing game-version")?;
+    let loader_version = property("fabric-loader-version")
+        .filter(|version| looks_like_loader_version(version))
+        .context("missing or invalid fabric-loader-version")?;
+
+    Ok(DetectedEnvironment {
+        loader: Loader::Fabric,
+        loader_version: Some(loader_version.to_owned()),
+        minecraft_version: minecraft_version.to_owned(),
+    })
+}
+
 fn detect_fabric_server_jars(
     root: &Path,
     known_game_versions: Option<&GameVersionIndex>,
@@ -387,8 +413,17 @@ fn detect_fabric_server_jars(
                 return None;
             }
 
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            let (loader_version, minecraft_version) = parse_root_fabric_server_jar(&file_name)?;
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            if !file_name.ends_with(".jar") {
+                return None;
+            }
+            if let Ok(environment) = read_fabric_server_launcher(&entry.path()) {
+                return supports_minecraft_version(&environment.minecraft_version, known_game_versions)
+                    .then_some(environment);
+            }
+
+            let (loader_version, minecraft_version) = parse_root_fabric_server_jar(file_name)?;
             if !supports_minecraft_version(&minecraft_version, known_game_versions) {
                 return None;
             }
