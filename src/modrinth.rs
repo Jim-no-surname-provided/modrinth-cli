@@ -146,6 +146,8 @@ struct LatestVersionsRequest<'a> {
     algorithm: &'static str,
     loaders: Vec<String>,
     game_versions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_types: Option<&'static [&'static str]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,6 +385,7 @@ impl ModrinthClient {
         &self,
         hashes: &[String],
         environment: &DetectedEnvironment,
+        version_types: Option<&'static [&'static str]>,
     ) -> Result<HashMap<String, Version>> {
         if hashes.is_empty() {
             return Ok(HashMap::new());
@@ -393,16 +396,21 @@ impl ModrinthClient {
             algorithm: "sha1",
             loaders: vec![environment.loader.as_str().to_string()],
             game_versions: vec![environment.minecraft_version.clone()],
+            version_types,
         };
 
-        self.post_json_cached(
+        let mut versions: HashMap<String, Version> = self.post_json_cached(
             CacheKind::LatestVersionsLookup,
             format!("{}/version_files/update", self.base_url),
             &body,
             "failed to query latest versions from hashes",
             "latest versions request failed",
             "failed to decode latest versions response",
-        )
+        )?;
+        if let Some(allowed) = version_types {
+            versions.retain(|_, version| allowed.contains(&version.version_type.as_str()));
+        }
+        Ok(versions)
     }
 
     pub fn download(&self, url: &str) -> Result<Response> {

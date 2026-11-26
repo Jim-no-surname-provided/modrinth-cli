@@ -61,11 +61,16 @@ enum Command {
         command: LoaderCommand,
     },
     #[command(about = "List installed mods and show available updates")]
-    List,
+    List {
+        #[arg(long, help = "Include beta and alpha mod updates")]
+        include_prerelease: bool,
+    },
     #[command(alias = "u")]
     Update {
-        #[arg(help = "Installed mod name, or `all kjk` to update everything")]
+        #[arg(help = "Installed mod name, or `all` to update everything")]
         target: Vec<String>,
+        #[arg(long, help = "Include beta and alpha mod updates")]
+        include_prerelease: bool,
     },
     #[command(alias = "s")]
     Search {
@@ -224,26 +229,29 @@ fn run() -> Result<()> {
                 LoaderCommand::Update => update_loader(&context)?,
             }
         }
-        Command::List => {
+        Command::List { include_prerelease } => {
             let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             println!();
-            list_mods(&client, &context)?;
+            list_mods(&client, &context, include_prerelease)?;
             println!();
             if let Err(error) = check_loader(&context) {
                 eprintln!("Loader check failed: {error:#}");
             }
         }
-        Command::Update { target } => {
+        Command::Update {
+            target,
+            include_prerelease,
+        } => {
             let target = join_words(target)?;
             let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             if target.eq_ignore_ascii_case("all") {
-                update_all(&client, &context)?;
+                update_all(&client, &context, include_prerelease)?;
             } else {
-                update_named(&client, &context, &target)?;
+                update_named(&client, &context, &target, include_prerelease)?;
             }
         }
         Command::Search {
@@ -885,7 +893,27 @@ fn install_projects(
     Ok(())
 }
 
-fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> {
+fn update_version_types(include_prerelease: bool) -> &'static [&'static str] {
+    if include_prerelease {
+        &["release", "beta", "alpha"]
+    } else {
+        &["release"]
+    }
+}
+
+fn prerelease_suffix(version: &Version) -> &'static str {
+    match version.version_type.as_str() {
+        "beta" => " (beta)",
+        "alpha" => " (alpha)",
+        _ => "",
+    }
+}
+
+fn list_mods(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    include_prerelease: bool,
+) -> Result<()> {
     // Scan once and check recognized jars for compatible updates
     let mut mods = resolve_installed_jars(client, context)?;
     mods.sort_by(|left, right| left.path.cmp(&right.path));
@@ -905,7 +933,11 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
             name_width = name_width.max(name.to_string_lossy().chars().count());
         }
     }
-    let latest = client.latest_versions_for_hashes(&hashes, &context.environment)?;
+    let latest = client.latest_versions_for_hashes(
+        &hashes,
+        &context.environment,
+        Some(update_version_types(include_prerelease)),
+    )?;
 
     // Color the borders without changing the table text
     let (gray, foreground) = if env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
@@ -915,7 +947,11 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
     };
     let edge = format!("{gray}│{foreground}");
     let update_heading = "Update?";
-    let update_width = update_heading.len();
+    let update_width = if include_prerelease {
+        update_heading.len().max("⬇ (alpha)".chars().count())
+    } else {
+        update_heading.len()
+    };
     let name_rule = "─".repeat(name_width + 2);
     let version_rule = "─".repeat(version_width + 2);
     let update_rule = "─".repeat(update_width + 2);
@@ -936,12 +972,14 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
     let mut update_count = 0;
     for entry in mods {
         if let Some(item) = entry.resolved {
-            let has_update = latest
+            let update = latest
                 .get(&item.sha1)
-                .is_some_and(|version| has_jar_update(&item.sha1, &item.version, version));
-            let marker = if has_update { "⬇" } else { "" };
-            update_count += usize::from(has_update);
-            print_row(&item.project.title, &item.version.version_number, marker);
+                .filter(|version| has_jar_update(&item.sha1, &item.version, version));
+            let marker = update
+                .map(|version| format!("⬇{}", prerelease_suffix(version)))
+                .unwrap_or_default();
+            update_count += usize::from(update.is_some());
+            print_row(&item.project.title, &item.version.version_number, &marker);
         } else {
             let name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
             print_row(&name.to_string_lossy(), "Unknown", "");
@@ -961,7 +999,11 @@ fn has_jar_update(installed_sha1: &str, installed: &Version, latest: &Version) -
         })
 }
 
-fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> {
+fn update_all(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    include_prerelease: bool,
+) -> Result<()> {
     let installed = build_installed_inventory(client, context)?;
     if installed.is_empty() {
         println!(
@@ -975,7 +1017,11 @@ fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()>
         .values()
         .map(|item| item.jar.sha1.clone())
         .collect();
-    let latest_by_hash = client.latest_versions_for_hashes(&hashes, &context.environment)?;
+    let latest_by_hash = client.latest_versions_for_hashes(
+        &hashes,
+        &context.environment,
+        Some(update_version_types(include_prerelease)),
+    )?;
     let mut updated = 0usize;
 
     for item in installed.into_values() {
@@ -1003,7 +1049,12 @@ fn update_all(client: &ModrinthClient, context: &MinecraftContext) -> Result<()>
     Ok(())
 }
 
-fn update_named(client: &ModrinthClient, context: &MinecraftContext, query: &str) -> Result<()> {
+fn update_named(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    query: &str,
+    include_prerelease: bool,
+) -> Result<()> {
     let installed = build_installed_inventory(client, context)?;
     if installed.is_empty() {
         bail!(
@@ -1047,8 +1098,11 @@ fn update_named(client: &ModrinthClient, context: &MinecraftContext, query: &str
         .find(|entry| entry.project.id == selected_project_id)
         .ok_or_else(|| anyhow!("installed project disappeared during selection"))?;
 
-    let latest_by_hash =
-        client.latest_versions_for_hashes(&[item.jar.sha1.clone()], &context.environment)?;
+    let latest_by_hash = client.latest_versions_for_hashes(
+        &[item.jar.sha1.clone()],
+        &context.environment,
+        Some(update_version_types(include_prerelease)),
+    )?;
 
     match latest_by_hash.get(&item.jar.sha1) {
         Some(latest_version) => {
@@ -1122,8 +1176,11 @@ fn update_selected_project_if_installed(
     visited: &mut HashSet<String>,
     depth: usize,
 ) -> Result<()> {
-    let latest_by_hash =
-        client.latest_versions_for_hashes(&[installed.jar.sha1.clone()], &context.environment)?;
+    let latest_by_hash = client.latest_versions_for_hashes(
+        &[installed.jar.sha1.clone()],
+        &context.environment,
+        None,
+    )?;
 
     let Some(latest_version) = latest_by_hash.get(&installed.jar.sha1).cloned() else {
         println!(
@@ -1296,6 +1353,16 @@ fn replace_if_newer(
     installed: &InstalledMod,
     latest_version: &Version,
 ) -> Result<bool> {
+    if latest_version.date_published < installed.version.date_published {
+        println!(
+            "Skipped {}: {} was published before installed version {}.",
+            installed.project.title,
+            latest_version.version_number,
+            installed.version.version_number,
+        );
+        return Ok(false);
+    }
+
     let latest_file = latest_version.primary_download_file().ok_or_else(|| {
         anyhow!(
             "latest version {} for {} has no downloadable jar",
@@ -1324,8 +1391,11 @@ fn replace_if_newer(
     )?;
 
     println!(
-        "Updated {}: {} -> {}",
-        installed.project.title, installed.version.version_number, latest_version.version_number
+        "Updated {}: {} -> {}{}",
+        installed.project.title,
+        installed.version.version_number,
+        latest_version.version_number,
+        prerelease_suffix(latest_version),
     );
     Ok(true)
 }
@@ -3076,7 +3146,13 @@ mod tests {
         });
 
         server.mock(|when, then| {
-            when.method(POST).path("/version_files/update");
+            when.method(POST).path("/version_files/update").json_body(json!({
+                "hashes": [&current_sha1],
+                "algorithm": "sha1",
+                "loaders": ["fabric"],
+                "game_versions": ["1.21.1"],
+                "version_types": ["release"]
+            }));
             then.status(200).json_body(json!({
                 current_sha1.clone(): mock_version(
                     "ver-new",
@@ -3096,10 +3172,57 @@ mod tests {
             then.status(200).body(latest_bytes);
         });
 
+        let beta_bytes = b"newer-beta";
+        let beta_sha1 = bytes_to_hex(&Sha1::digest(beta_bytes));
+        let mut beta = mock_version(
+            "ver-beta", "proj-sodium", "3.0.0-beta", "beta", &beta_sha1,
+            "sodium.jar", &server.url("/files/sodium-beta.jar"), json!([]),
+        );
+        beta["date_published"] = json!("2026-03-29T00:00:00Z");
+        server.mock(|when, then| {
+            when.method(POST).path("/version_files/update").json_body(json!({
+                "hashes": [&current_sha1],
+                "algorithm": "sha1",
+                "loaders": ["fabric"],
+                "game_versions": ["1.21.1"],
+                "version_types": ["release", "beta", "alpha"]
+            }));
+            then.json_body(json!({current_sha1.clone(): beta.clone()}));
+        });
+        let beta_download = server.mock(|when, then| {
+            when.method(GET).path("/files/sodium-beta.jar");
+            then.body(beta_bytes);
+        });
+
         let client = ModrinthClient::new(server.base_url()).unwrap();
-        update_all(&client, &context).unwrap();
+        update_all(&client, &context, false).unwrap();
 
         assert_eq!(compute_sha1(&installed_path).unwrap(), latest_sha1);
+        assert_eq!(beta_download.calls(), 0);
+
+        fs::write(&installed_path, current_bytes).unwrap();
+        let selected: Version = serde_json::from_value(beta).unwrap();
+        assert_eq!(prerelease_suffix(&selected), " (beta)");
+        update_named(&client, &context, "sodium", true).unwrap();
+        assert_eq!(compute_sha1(&installed_path).unwrap(), beta_sha1);
+        beta_download.assert();
+
+        let mut older = selected.clone();
+        older.version_type = "release".into();
+        older.date_published -= chrono::Duration::days(1);
+        older.files[0].hashes.sha1 = Some(latest_sha1);
+        let installed = InstalledMod {
+            jar: InstalledJar {
+                path: installed_path.clone(),
+                sha1: beta_sha1,
+            },
+            version: selected,
+            project: serde_json::from_value(mock_project(
+                "proj-sodium", "sodium", "Sodium", 100000,
+            )).unwrap(),
+        };
+        assert!(!replace_if_newer(&client, &context, &installed, &older).unwrap());
+        assert_eq!(fs::read(&installed_path).unwrap(), beta_bytes);
     }
 
     #[test]
