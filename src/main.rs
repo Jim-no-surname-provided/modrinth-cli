@@ -64,7 +64,7 @@ enum Command {
     List,
     #[command(alias = "u")]
     Update {
-        #[arg(help = "Installed mod name, or `all` to update everything")]
+        #[arg(help = "Installed mod name, or `all kjk` to update everything")]
         target: Vec<String>,
     },
     #[command(alias = "s")]
@@ -417,6 +417,13 @@ fn compatible_loader_releases(
     Ok(std::mem::take(releases))
 }
 
+fn is_numeric_loader_release(release: &LoaderRelease) -> bool {
+    release
+        .id
+        .split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn check_loader(context: &MinecraftContext) -> Result<()> {
     use minecraft::Loader;
 
@@ -435,10 +442,7 @@ fn check_loader(context: &MinecraftContext) -> Result<()> {
         format!("no compatible {loader} releases for Minecraft {minecraft_version}")
     })?;
     let stable = releases.iter().find(|release| match loader {
-        Loader::Forge | Loader::NeoForge => release
-            .id
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        Loader::Forge | Loader::NeoForge => is_numeric_loader_release(release),
         Loader::Fabric | Loader::Quilt => release.stable,
     });
 
@@ -590,8 +594,60 @@ fn update_loader_forge(_context: &MinecraftContext) -> Result<()> {
     bail!("Forge loader updates are not implemented yet")
 }
 
-fn update_loader_neoforge(_context: &MinecraftContext) -> Result<()> {
-    bail!("NeoForge loader updates are not implemented yet")
+fn update_loader_neoforge(context: &MinecraftContext) -> Result<()> {
+    let environment = &context.environment;
+    let minecraft_version = &environment.minecraft_version;
+    let installed = environment
+        .loader_version
+        .as_deref()
+        .context("could not determine the installed NeoForge version")?;
+
+    // Compare the installed version with the newest stable release
+    let releases = compatible_loader_releases(&environment.loader, minecraft_version)?;
+    let Some(target_index) = releases.iter().position(is_numeric_loader_release) else {
+        println!("No stable NeoForge release found for Minecraft {minecraft_version}.");
+        return Ok(());
+    };
+    let installed_index = releases
+        .iter()
+        .position(|release| release.id == installed)
+        .with_context(|| format!("could not compare installed NeoForge {installed}"))?;
+    if target_index >= installed_index {
+        println!("No stable NeoForge update available for Minecraft {minecraft_version}.");
+        return Ok(());
+    }
+    let target = &releases[target_index].id;
+
+    // Download the official installer to a temporary JAR
+    let url = format!(
+        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{target}/neoforge-{target}-installer.jar"
+    );
+    let mut response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?
+        .get(url)
+        .send()
+        .context("failed to download the NeoForge installer")?
+        .error_for_status()
+        .context("NeoForge installer download failed")?;
+    let mut installer = tempfile::Builder::new().suffix(".jar").tempfile()?;
+    response.copy_to(installer.as_file_mut())?;
+
+    // Let the installer update the existing server
+    println!("Updating NeoForge {installed} → {target} for Minecraft {minecraft_version}.");
+    let status = std::process::Command::new("java")
+        .arg("-jar")
+        .arg(installer.path())
+        .arg("--installServer")
+        .current_dir(&context.root_dir)
+        .status()
+        .context("could not start Java for the NeoForge installer")?;
+    if !status.success() {
+        bail!("NeoForge installer exited with {status}");
+    }
+
+    println!("NeoForge installer completed for {target}.");
+    Ok(())
 }
 
 fn install_from_query(
