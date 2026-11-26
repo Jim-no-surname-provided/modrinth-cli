@@ -203,10 +203,55 @@ fn detect_fabric(
     )
 }
 
+pub fn read_quilt_server_launcher(root: &Path) -> Result<(String, Option<String>)> {
+    let launcher = root.join("quilt-server-launch.jar");
+    let mut jar = zip::ZipArchive::new(fs::File::open(&launcher)?)?;
+    let mut manifest = String::new();
+    jar.by_name("META-INF/MANIFEST.MF")?
+        .read_to_string(&mut manifest)?;
+
+    // Join continuation lines before reading the launcher's classpath
+    let manifest = manifest.replace("\r\n", "\n").replace("\n ", "");
+    let classpath = manifest
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| line.strip_prefix("Class-Path: "))
+        .context("Quilt server launcher has no Class-Path")?;
+
+    // Read the versions from the Maven-style paths in the classpath
+    let library = |prefix: &str, artifact: &str| {
+        classpath.split_whitespace().find_map(|entry| {
+            let (version, filename) = entry.strip_prefix(prefix)?.split_once('/')?;
+            (!version.is_empty()
+                && filename == format!("{artifact}-{version}.jar")
+                && root.join(entry).is_file())
+            .then(|| version.to_owned())
+        })
+    };
+
+    let loader_version = library("libraries/org/quiltmc/quilt-loader/", "quilt-loader")
+        .context("Quilt server launcher does not reference an installed Quilt Loader JAR")?;
+    let minecraft_version = library("libraries/net/fabricmc/intermediary/", "intermediary")
+        .or_else(|| library("libraries/org/quiltmc/hashed/", "hashed"));
+
+    Ok((loader_version, minecraft_version))
+}
+
 fn detect_quilt(
     root: &Path,
     known_game_versions: Option<&GameVersionIndex>,
 ) -> Option<DetectedEnvironment> {
+    // Prefer the launcher when it identifies the Minecraft version
+    if let Ok((loader_version, Some(minecraft_version))) = read_quilt_server_launcher(root)
+        && supports_minecraft_version(&minecraft_version, known_game_versions)
+    {
+        return Some(DetectedEnvironment {
+            loader: Loader::Quilt,
+            loader_version: Some(loader_version),
+            minecraft_version,
+        });
+    }
+
     latest_environment(
         detect_versioned_library_jars(
             &root.join("libraries/org/quiltmc/quilt-loader"),

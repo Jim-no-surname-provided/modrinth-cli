@@ -363,6 +363,14 @@ fn compatible_loader_releases(
     loader: &minecraft::Loader,
     minecraft_version: &str,
 ) -> Result<Vec<LoaderRelease>> {
+    fetch_compatible_loader_releases(loader, minecraft_version, &str::to_owned)
+}
+
+fn fetch_compatible_loader_releases(
+    loader: &minecraft::Loader,
+    minecraft_version: &str,
+    resolve_url: &dyn Fn(&str) -> String,
+) -> Result<Vec<LoaderRelease>> {
     use minecraft::Loader;
 
     // Fetch the Modrinth manifest for the detected loader
@@ -376,7 +384,7 @@ fn compatible_loader_releases(
     let mut manifest: LoaderManifest = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?
-        .get(url)
+        .get(resolve_url(&url))
         .send()
         .with_context(|| format!("failed to fetch the {loader} manifest"))?
         .error_for_status()
@@ -488,17 +496,28 @@ fn check_loader(context: &MinecraftContext) -> Result<()> {
 }
 
 fn update_loader(context: &MinecraftContext) -> Result<()> {
+    update_loader_with(context, &str::to_owned, run_java_installer)
+}
+
+fn update_loader_with(
+    context: &MinecraftContext,
+    resolve_url: &dyn Fn(&str) -> String,
+    run_installer: fn(&Path, &Path, &[&str]) -> Result<()>,
+) -> Result<()> {
     use minecraft::Loader;
 
     match context.environment.loader {
-        Loader::Fabric => update_loader_fabric(context),
-        Loader::Quilt => update_loader_quilt(context),
-        Loader::Forge => update_loader_forge(context),
-        Loader::NeoForge => update_loader_neoforge(context),
+        Loader::Fabric => update_loader_fabric(context, resolve_url),
+        Loader::Quilt => update_loader_quilt(context, resolve_url, run_installer),
+        Loader::Forge => update_loader_forge(context, resolve_url, run_installer),
+        Loader::NeoForge => update_loader_neoforge(context, resolve_url, run_installer),
     }
 }
 
-fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
+fn update_loader_fabric(
+    context: &MinecraftContext,
+    resolve_url: &dyn Fn(&str) -> String,
+) -> Result<()> {
     // Find the one executable launcher in the instance root
     let mut launchers = Vec::new();
     for entry in fs::read_dir(&context.root_dir)? {
@@ -512,11 +531,18 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
         }
     }
     let [(launcher, environment)] = launchers.as_slice() else {
-        bail!("expected one executable Fabric launcher in {}, found {}", context.root_dir.display(), launchers.len());
+        bail!(
+            "expected one executable Fabric launcher in {}, found {}",
+            context.root_dir.display(),
+            launchers.len()
+        );
     };
     let minecraft_version = &environment.minecraft_version;
     if minecraft_version != &context.environment.minecraft_version {
-        bail!("the Fabric launcher targets Minecraft {minecraft_version}, but the detected instance targets {}", context.environment.minecraft_version);
+        bail!(
+            "the Fabric launcher targets Minecraft {minecraft_version}, but the detected instance targets {}",
+            context.environment.minecraft_version
+        );
     }
     let installed = environment
         .loader_version
@@ -524,7 +550,8 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
         .context("missing installed Fabric Loader version")?;
 
     // Compare the installed version with the newest stable compatible release
-    let releases = compatible_loader_releases(&environment.loader, minecraft_version)?;
+    let releases =
+        fetch_compatible_loader_releases(&environment.loader, minecraft_version, resolve_url)?;
     let Some(target_index) = releases.iter().position(|release| release.stable) else {
         println!("No stable Fabric Loader release found for Minecraft {minecraft_version}.");
         return Ok(());
@@ -532,7 +559,11 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
     let installed_index = releases
         .iter()
         .position(|release| release.id == installed)
-        .with_context(|| format!("could not compare installed Fabric Loader {installed} with the available releases"))?;
+        .with_context(|| {
+            format!(
+                "could not compare installed Fabric Loader {installed} with the available releases"
+            )
+        })?;
     if target_index >= installed_index {
         println!("No stable Fabric Loader update available for Minecraft {minecraft_version}.");
         return Ok(());
@@ -542,11 +573,13 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
     // Download and check the new launcher before touching the old one
     let game_segment = urlencoding::encode(minecraft_version);
     let loader_segment = urlencoding::encode(target);
-    let url = format!("https://meta.fabricmc.net/v2/versions/loader/{game_segment}/{loader_segment}/stable/server/jar");
+    let url = format!(
+        "https://meta.fabricmc.net/v2/versions/loader/{game_segment}/{loader_segment}/stable/server/jar"
+    );
     let mut response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?
-        .get(url)
+        .get(resolve_url(&url))
         .send()
         .context("failed to download the Fabric launcher")?
         .error_for_status()
@@ -558,16 +591,22 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
     if downloaded.minecraft_version != *minecraft_version
         || downloaded.loader_version.as_deref() != Some(target.as_str())
     {
-        bail!("downloaded Fabric launcher does not match Minecraft {minecraft_version} and Fabric Loader {target}");
+        bail!(
+            "downloaded Fabric launcher does not match Minecraft {minecraft_version} and Fabric Loader {target}"
+        );
     }
 
     // Back up the old launcher before replacing it at the same path
     let current = File::open(launcher)?;
-    current.try_lock().context("could not lock the Fabric launcher for updating")?;
+    current
+        .try_lock()
+        .context("could not lock the Fabric launcher for updating")?;
     if minecraft::read_fabric_server_launcher(launcher)? != *environment {
         bail!("the Fabric launcher changed while downloading the update");
     }
-    download.as_file().set_permissions(current.metadata()?.permissions())?;
+    download
+        .as_file()
+        .set_permissions(current.metadata()?.permissions())?;
     download.as_file().sync_all()?;
     let mut backup_name = launcher.as_os_str().to_os_string();
     backup_name.push(format!(".{installed}.bak"));
@@ -576,7 +615,10 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
         .with_context(|| format!("could not back up the launcher to {}", backup.display()))?;
     if let Err(error) = download.persist(launcher) {
         fs::remove_file(&backup).with_context(|| {
-            format!("could not replace the launcher ({error}) or remove the unused backup {}", backup.display())
+            format!(
+                "could not replace the launcher ({error}) or remove the unused backup {}",
+                backup.display()
+            )
         })?;
         return Err(error).context("could not replace the Fabric launcher");
     }
@@ -586,67 +628,182 @@ fn update_loader_fabric(context: &MinecraftContext) -> Result<()> {
     Ok(())
 }
 
-fn update_loader_quilt(_context: &MinecraftContext) -> Result<()> {
-    bail!("Quilt loader updates are not implemented yet")
+#[derive(Deserialize)]
+struct QuiltInstallerRelease {
+    url: String,
 }
 
-fn update_loader_forge(_context: &MinecraftContext) -> Result<()> {
-    bail!("Forge loader updates are not implemented yet")
-}
-
-fn update_loader_neoforge(context: &MinecraftContext) -> Result<()> {
+fn update_loader_quilt(
+    context: &MinecraftContext,
+    resolve_url: &dyn Fn(&str) -> String,
+    run_installer: fn(&Path, &Path, &[&str]) -> Result<()>,
+) -> Result<()> {
     let environment = &context.environment;
-    let minecraft_version = &environment.minecraft_version;
-    let installed = environment
-        .loader_version
-        .as_deref()
-        .context("could not determine the installed NeoForge version")?;
+    let minecraft_version = environment.minecraft_version.as_str();
+    let (installed, launcher_game) =
+        minecraft::read_quilt_server_launcher(&context.root_dir)?;
+    if launcher_game.as_deref().is_some_and(|game| game != minecraft_version) {
+        bail!("Quilt launcher targets a different Minecraft version than the detected instance");
+    }
 
-    // Compare the installed version with the newest stable release
-    let releases = compatible_loader_releases(&environment.loader, minecraft_version)?;
-    let Some(target_index) = releases.iter().position(is_numeric_loader_release) else {
-        println!("No stable NeoForge release found for Minecraft {minecraft_version}.");
+    // Pick the newest stable loader for the current Minecraft version
+    let releases =
+        fetch_compatible_loader_releases(&environment.loader, minecraft_version, resolve_url)?;
+    let Some(target_index) = releases.iter().position(|release| release.stable) else {
+        println!("No stable Quilt Loader release found for Minecraft {minecraft_version}.");
         return Ok(());
     };
     let installed_index = releases
         .iter()
         .position(|release| release.id == installed)
-        .with_context(|| format!("could not compare installed NeoForge {installed}"))?;
+        .with_context(|| format!("could not compare installed Quilt Loader {installed}"))?;
     if target_index >= installed_index {
-        println!("No stable NeoForge update available for Minecraft {minecraft_version}.");
+        println!("No stable Quilt Loader update available for Minecraft {minecraft_version}.");
+        return Ok(());
+    }
+    let target = releases[target_index].id.as_str();
+
+    // Fetch the current official installer and download it to a temporary JAR
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let installers: Vec<QuiltInstallerRelease> = client
+        .get(resolve_url("https://meta.quiltmc.org/v3/versions/installer"))
+        .send()
+        .context("failed to fetch Quilt installer releases")?
+        .error_for_status()?
+        .json()
+        .context("failed to decode Quilt installer releases")?;
+    let release = installers.first().context("no Quilt installer release found")?;
+    let mut response = client
+        .get(resolve_url(&release.url))
+        .send()
+        .context("failed to download the Quilt installer")?
+        .error_for_status()?;
+    let mut installer = tempfile::Builder::new().suffix(".jar").tempfile()?;
+    response.copy_to(installer.as_file_mut())?;
+
+    // Update the launcher in place and keep the existing Minecraft server JAR
+    println!("Updating Quilt Loader {installed} → {target} for Minecraft {minecraft_version}.");
+    run_installer(
+        &context.root_dir,
+        installer.path(),
+        &["install", "server", minecraft_version, target, "--install-dir=."],
+    )
+    .context("Quilt server installation failed")?;
+
+    // Confirm the launcher now references the requested loader
+    let (actual, launcher_game) =
+        minecraft::read_quilt_server_launcher(&context.root_dir)?;
+    if actual != target || launcher_game.as_deref().is_some_and(|game| game != minecraft_version) {
+        bail!("Quilt installer did not configure Loader {target} for Minecraft {minecraft_version}");
+    }
+
+    println!("Updated Quilt Loader to {target} for Minecraft {minecraft_version}.");
+    Ok(())
+}
+
+fn update_loader_forge(
+    context: &MinecraftContext,
+    resolve_url: &dyn Fn(&str) -> String,
+    run_installer: fn(&Path, &Path, &[&str]) -> Result<()>,
+) -> Result<()> {
+    update_loader_with_server_installer(
+        context,
+        "Forge",
+        resolve_url,
+        run_installer,
+        |minecraft_version, target| {
+            let artifact = format!("{minecraft_version}-{target}");
+            format!(
+                "https://maven.minecraftforge.net/net/minecraftforge/forge/{artifact}/forge-{artifact}-installer.jar"
+            )
+        },
+    )
+}
+
+fn update_loader_neoforge(
+    context: &MinecraftContext,
+    resolve_url: &dyn Fn(&str) -> String,
+    run_installer: fn(&Path, &Path, &[&str]) -> Result<()>,
+) -> Result<()> {
+    update_loader_with_server_installer(
+        context,
+        "NeoForge",
+        resolve_url,
+        run_installer,
+        |_, target| {
+            format!(
+                "https://maven.neoforged.net/releases/net/neoforged/neoforge/{target}/neoforge-{target}-installer.jar"
+            )
+        },
+    )
+}
+
+fn update_loader_with_server_installer(
+    context: &MinecraftContext,
+    loader_name: &str,
+    resolve_url: &dyn Fn(&str) -> String,
+    run_installer: fn(&Path, &Path, &[&str]) -> Result<()>,
+    installer_url: impl FnOnce(&str, &str) -> String,
+) -> Result<()> {
+    let environment = &context.environment;
+    let minecraft_version = &environment.minecraft_version;
+    let installed = environment
+        .loader_version
+        .as_deref()
+        .with_context(|| format!("could not determine the installed {loader_name} version"))?;
+
+    // Compare the installed version with the newest stable release
+    let releases =
+        fetch_compatible_loader_releases(&environment.loader, minecraft_version, resolve_url)?;
+    let Some(target_index) = releases.iter().position(is_numeric_loader_release) else {
+        println!("No stable {loader_name} release found for Minecraft {minecraft_version}.");
+        return Ok(());
+    };
+    let installed_index = releases
+        .iter()
+        .position(|release| release.id == installed)
+        .with_context(|| format!("could not compare installed {loader_name} {installed}"))?;
+    if target_index >= installed_index {
+        println!("No stable {loader_name} update available for Minecraft {minecraft_version}.");
         return Ok(());
     }
     let target = &releases[target_index].id;
 
     // Download the official installer to a temporary JAR
-    let url = format!(
-        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{target}/neoforge-{target}-installer.jar"
-    );
+    let url = installer_url(minecraft_version, target);
     let mut response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?
-        .get(url)
+        .get(resolve_url(&url))
         .send()
-        .context("failed to download the NeoForge installer")?
+        .with_context(|| format!("failed to download the {loader_name} installer"))?
         .error_for_status()
-        .context("NeoForge installer download failed")?;
+        .with_context(|| format!("{loader_name} installer download failed"))?;
     let mut installer = tempfile::Builder::new().suffix(".jar").tempfile()?;
     response.copy_to(installer.as_file_mut())?;
 
     // Let the installer update the existing server
-    println!("Updating NeoForge {installed} → {target} for Minecraft {minecraft_version}.");
+    println!("Updating {loader_name} {installed} → {target} for Minecraft {minecraft_version}.");
+    run_installer(&context.root_dir, installer.path(), &["--installServer"])
+        .with_context(|| format!("{loader_name} server installation failed"))?;
+
+    println!("{loader_name} installer completed for {target}.");
+    Ok(())
+}
+
+fn run_java_installer(root: &Path, installer: &Path, args: &[&str]) -> Result<()> {
     let status = std::process::Command::new("java")
         .arg("-jar")
-        .arg(installer.path())
-        .arg("--installServer")
-        .current_dir(&context.root_dir)
+        .arg(installer)
+        .args(args)
+        .current_dir(root)
         .status()
-        .context("could not start Java for the NeoForge installer")?;
+        .context("could not start Java for the installer")?;
     if !status.success() {
-        bail!("NeoForge installer exited with {status}");
+        bail!("installer exited with {status}");
     }
-
-    println!("NeoForge installer completed for {target}.");
     Ok(())
 }
 
@@ -1856,6 +2013,249 @@ mod tests {
     use httpmock::MockServer;
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn fixture_jar(entry: &str, content: &str) -> Vec<u8> {
+        let mut jar = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        jar.start_file(entry, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        jar.write_all(content.as_bytes()).unwrap();
+        jar.finish().unwrap().into_inner()
+    }
+
+    fn fixture_loader_manifest(server: &MockServer, path: &str, game: &str, old: &str, new: &str) {
+        let releases = json!([{"id": new, "stable": true}, {"id": old, "stable": true}]);
+        let manifest = if path == "/quilt/v1/manifest.json" {
+            json!({
+                "gameVersions": [{"id": game, "loaders": [], "versionGroup": "modern"}],
+                "versionGroups": [{"id": "modern", "loaders": releases}]
+            })
+        } else {
+            json!({"gameVersions": [{"id": game, "loaders": releases}]})
+        };
+        server.mock(|when, then| {
+            when.method(GET).path(path);
+            then.json_body(manifest);
+        });
+    }
+
+    fn quilt_fixture_library(version: &str) -> String {
+        format!("libraries/org/quiltmc/quilt-loader/{version}/quilt-loader-{version}.jar")
+    }
+
+    fn quilt_fixture_jar(version: &str) -> Vec<u8> {
+        fixture_jar(
+            "META-INF/MANIFEST.MF",
+            &format!(
+                "Manifest-Version: 1.0\r\nClass-Path: {}\r\n\r\n",
+                quilt_fixture_library(version)
+            ),
+        )
+    }
+
+    fn simulate_server_installer(root: &Path, installer: &Path, args: &[&str]) -> Result<()> {
+        assert_eq!(
+            fs::read(root.join("server.jar"))?,
+            b"existing Minecraft server"
+        );
+        assert_eq!(
+            installer.extension().and_then(|ext| ext.to_str()),
+            Some("jar")
+        );
+        let payload = fs::read_to_string(installer)?;
+        if let Some(version) = payload.strip_prefix("quilt:") {
+            assert!(
+                args.windows(3)
+                    .any(|group| group == ["install", "server", "1.21.1"])
+            );
+            assert!(args.iter().any(|arg| arg.contains(version)));
+            let library = root.join(quilt_fixture_library(version));
+            fs::create_dir_all(library.parent().unwrap())?;
+            fs::write(library, b"new Quilt Loader")?;
+            fs::write(
+                root.join("quilt-server-launch.jar"),
+                quilt_fixture_jar(version),
+            )?;
+        } else {
+            assert_eq!(args, ["--installServer"]);
+            let args_file = format!("libraries/{payload}/unix_args.txt");
+            let path = root.join(&args_file);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, b"new installer args")?;
+            fs::write(root.join("run.sh"), format!("java @{args_file} \"$@\"\n"))?;
+        }
+        Ok(())
+    }
+
+    fn run_loader_update_fixture(root: &Path, server: &MockServer) -> Result<()> {
+        update_loader_with(
+            &discover_context(root, None)?,
+            &|url| server.url(reqwest::Url::parse(url).unwrap().path()),
+            simulate_server_installer,
+        )
+    }
+
+    #[test]
+    fn loader_update_replaces_fabric_server_launcher() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("mods")).unwrap();
+        let launcher = root.path().join("fabric-server.jar");
+        let original = fixture_jar(
+            "install.properties",
+            "fabric-loader-version=0.16.10\ngame-version=1.21.1\n",
+        );
+        let replacement = fixture_jar(
+            "install.properties",
+            "fabric-loader-version=0.16.14\ngame-version=1.21.1\n",
+        );
+        fs::write(&launcher, &original).unwrap();
+        let server = MockServer::start();
+        fixture_loader_manifest(
+            &server,
+            "/fabric/v0/manifest.json",
+            "1.21.1",
+            "0.16.10",
+            "0.16.14",
+        );
+        let download = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/versions/loader/1.21.1/0.16.14/stable/server/jar");
+            then.body(replacement.clone());
+        });
+
+        run_loader_update_fixture(root.path(), &server).unwrap();
+
+        download.assert();
+        assert_eq!(fs::read(&launcher).unwrap(), replacement);
+        assert_eq!(
+            fs::read(root.path().join("fabric-server.jar.0.16.10.bak")).unwrap(),
+            original
+        );
+        let detected = discover_context(root.path(), None).unwrap();
+        assert_eq!(
+            detected.environment.loader_version.as_deref(),
+            Some("0.16.14")
+        );
+        assert_eq!(detected.environment.minecraft_version, "1.21.1");
+    }
+
+    fn assert_server_installer_update(
+        manifest: &str,
+        game: &str,
+        old: &str,
+        new: &str,
+        old_library: &str,
+        new_library: &str,
+        installer_path: &str,
+    ) {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("mods")).unwrap();
+        fs::create_dir_all(root.path().join("libraries").join(old_library)).unwrap();
+        fs::write(root.path().join("server.jar"), b"existing Minecraft server").unwrap();
+        fs::write(
+            root.path().join("run.sh"),
+            format!("java @libraries/{old_library}/unix_args.txt \"$@\"\n"),
+        )
+        .unwrap();
+        let server = MockServer::start();
+        fixture_loader_manifest(&server, manifest, game, old, new);
+        let download = server.mock(|when, then| {
+            when.method(GET).path(installer_path);
+            then.body(new_library);
+        });
+
+        run_loader_update_fixture(root.path(), &server).unwrap();
+
+        download.assert();
+        let args_file = format!("libraries/{new_library}/unix_args.txt");
+        assert_eq!(
+            fs::read(root.path().join(&args_file)).unwrap(),
+            b"new installer args"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("run.sh")).unwrap(),
+            format!("java @{args_file} \"$@\"\n")
+        );
+        assert_eq!(
+            fs::read(root.path().join("server.jar")).unwrap(),
+            b"existing Minecraft server"
+        );
+    }
+
+    #[test]
+    fn loader_update_runs_forge_server_installer() {
+        assert_server_installer_update(
+            "/forge/v0/manifest.json",
+            "1.20.1",
+            "47.4.28",
+            "47.4.29",
+            "net/minecraftforge/forge/1.20.1-47.4.28",
+            "net/minecraftforge/forge/1.20.1-47.4.29",
+            "/net/minecraftforge/forge/1.20.1-47.4.29/forge-1.20.1-47.4.29-installer.jar",
+        );
+    }
+
+    #[test]
+    fn loader_update_runs_neoforge_server_installer() {
+        assert_server_installer_update(
+            "/neo/v0/manifest.json",
+            "1.21.1",
+            "21.1.243",
+            "21.1.268",
+            "net/neoforged/neoforge/21.1.243",
+            "net/neoforged/neoforge/21.1.268",
+            "/releases/net/neoforged/neoforge/21.1.268/neoforge-21.1.268-installer.jar",
+        );
+    }
+
+    #[test]
+    fn loader_update_updates_quilt_server_launcher() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("mods")).unwrap();
+        let library = root.path().join(quilt_fixture_library("0.27.0"));
+        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        fs::write(&library, b"old Quilt Loader").unwrap();
+        fs::write(
+            library.with_file_name("quilt-loader-0.27.0-1.21.1.jar"),
+            b"",
+        )
+        .unwrap();
+        fs::write(root.path().join("server.jar"), b"existing Minecraft server").unwrap();
+        let launcher = root.path().join("quilt-server-launch.jar");
+        fs::write(&launcher, quilt_fixture_jar("0.27.0")).unwrap();
+        let server = MockServer::start();
+        fixture_loader_manifest(
+            &server,
+            "/quilt/v1/manifest.json",
+            "1.21.1",
+            "0.27.0",
+            "0.28.0",
+        );
+        server.mock(|when, then| {
+            when.method(GET).path("/v3/versions/installer");
+            then.json_body(json!([{"version": "0.12.1", "url": "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/0.12.1/quilt-installer-0.12.1.jar"}]));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path(
+                "/repository/release/org/quiltmc/quilt-installer/0.12.1/quilt-installer-0.12.1.jar",
+            );
+            then.body("quilt:0.28.0");
+        });
+
+        run_loader_update_fixture(root.path(), &server).unwrap();
+
+        let mut jar = zip::ZipArchive::new(File::open(launcher).unwrap()).unwrap();
+        let mut manifest = String::new();
+        jar.by_name("META-INF/MANIFEST.MF")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        assert!(manifest.contains(&format!("Class-Path: {}", quilt_fixture_library("0.28.0"))));
+        assert!(root.path().join(quilt_fixture_library("0.28.0")).is_file());
+        assert_eq!(
+            fs::read(root.path().join("server.jar")).unwrap(),
+            b"existing Minecraft server"
+        );
+    }
 
     fn mock_project(id: &str, slug: &str, title: &str, downloads: u64) -> serde_json::Value {
         json!({
