@@ -55,6 +55,11 @@ enum Command {
         about = "Open an interactive terminal UI for live search and multi-select install"
     )]
     DynamicInstaller,
+    #[command(about = "Check for or apply mod loader updates")]
+    Loader {
+        #[command(subcommand)]
+        command: LoaderCommand,
+    },
     #[command(about = "List installed mods and show available updates")]
     List,
     #[command(alias = "u")]
@@ -104,6 +109,14 @@ enum Command {
         #[command(subcommand)]
         command: Option<CacheCommand>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LoaderCommand {
+    #[command(about = "Check for a compatible mod loader update")]
+    Check,
+    #[command(about = "Apply a compatible mod loader update")]
+    Update,
 }
 
 #[derive(Subcommand, Debug)]
@@ -202,10 +215,19 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Command::List => {
-            // Detect the Minecraft version and loader for the update check
+        Command::Loader { command } => {
             let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
+
+            match command {
+                LoaderCommand::Check => check_loader(&context)?,
+                LoaderCommand::Update => update_loader(&context)?,
+            }
+        }
+        Command::List => {
+            let known_game_versions = load_known_game_versions(&client);
+            let context = discover_context(&cwd, known_game_versions.as_ref())?;
+            print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             list_mods(&client, &context)?;
         }
         Command::Update { target } => {
@@ -304,6 +326,75 @@ fn discover_context(
     MinecraftContext::discover_with_game_versions(cwd, known_game_versions)
 }
 
+fn check_loader(context: &MinecraftContext) -> Result<()> {
+    let environment = &context.environment;
+    match &environment.loader {
+        minecraft::Loader::Fabric => check_loader_fabric(environment),
+        loader => bail!("Loader update checks are not supported for {loader}"),
+    }
+}
+
+#[derive(Deserialize)]
+struct FabricLoaderEntry {
+    loader: FabricLoaderVersion,
+}
+
+#[derive(Deserialize)]
+struct FabricLoaderVersion {
+    version: String,
+    stable: bool,
+}
+
+fn check_loader_fabric(environment: &DetectedEnvironment) -> Result<()> {
+    let installed = environment
+        .loader_version
+        .as_deref()
+        .context("could not determine the installed Fabric Loader version")?;
+    let minecraft_version = &environment.minecraft_version;
+
+    // Fetch compatible Fabric Loader versions in newest-first order
+    let game_version = urlencoding::encode(minecraft_version);
+    let url = format!("https://meta.fabricmc.net/v2/versions/loader/{game_version}");
+    let versions: Vec<FabricLoaderEntry> = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?
+        .get(url)
+        .send()
+        .context("failed to contact Fabric Meta")?
+        .error_for_status()
+        .with_context(|| format!("Fabric Meta lookup failed for Minecraft {minecraft_version}"))?
+        .json()
+        .context("failed to decode the Fabric Meta response")?;
+
+    // Use Fabric Meta's ordering to compare the installed and stable versions
+    let latest_index = versions
+        .iter()
+        .position(|entry| entry.loader.stable)
+        .with_context(|| format!("no stable Fabric Loader found for Minecraft {minecraft_version}"))?;
+    let installed_index = versions
+        .iter()
+        .position(|entry| entry.loader.version == installed)
+        .with_context(|| {
+            format!("Fabric Meta did not list installed version {installed} for Minecraft {minecraft_version}")
+        })?;
+    let latest = &versions[latest_index].loader.version;
+
+    if latest_index < installed_index {
+        println!("Fabric Loader {installed} → {latest} available for Minecraft {minecraft_version}");
+    } else {
+        println!(
+            "Fabric Loader {installed} is installed for Minecraft {minecraft_version}. \
+             Latest stable version is {latest}. No update available."
+        );
+    }
+
+    Ok(())
+}
+
+fn update_loader(_context: &MinecraftContext) -> Result<()> {
+    bail!("mod loader update is not implemented yet")
+}
+
 fn install_from_query(
     client: &ModrinthClient,
     context: &MinecraftContext,
@@ -386,6 +477,7 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
     // Scan once and check recognized jars for compatible updates
     let mut mods = resolve_installed_jars(client, context)?;
     mods.sort_by(|left, right| left.path.cmp(&right.path));
+
     // Collect hashes for the update lookup and measure the table columns
     let mut hashes = Vec::new();
     let mut name_width = "Mod".len();
@@ -403,7 +495,6 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
     }
     let latest = client.latest_versions_for_hashes(&hashes, &context.environment)?;
 
-    // Print each row and count available updates as we go
     println!(
         "{:<name_width$} | {:<version_width$} | Update available",
         "Mod", "Version"
@@ -893,11 +984,11 @@ fn build_installed_inventory(
     Ok(installed)
 }
 
+// Seperated from buil_installed_inventory into its own function so it can be called on its own
 fn resolve_installed_jars(
     client: &ModrinthClient,
     context: &MinecraftContext,
 ) -> Result<Vec<InstalledInventoryCacheEntry>> {
-    // Scan the mods directory and load previous lookups
     fs::create_dir_all(&context.mods_dir)
         .with_context(|| format!("failed to create {}", context.mods_dir.display()))?;
 
@@ -912,7 +1003,6 @@ fn resolve_installed_jars(
     let mut next_cache_entries = Vec::with_capacity(jars.len());
 
     for jar in jars {
-        // Reuse lookups for jars that have stayed the same
         if let Some(cached_entry) = cached_entries
             .get(&jar.path)
             .filter(|entry| entry.matches(&jar))
@@ -925,7 +1015,6 @@ fn resolve_installed_jars(
             continue;
         }
 
-        // Look up new or changed jars by their file hash
         let sha1 = compute_sha1(&jar.path)?;
         let resolved = match client.version_from_hash(&sha1)? {
             Some(version) => fetch_project_cached(client, &mut project_cache, &version.project_id)?
@@ -937,7 +1026,7 @@ fn resolve_installed_jars(
             None => None,
         };
 
-        next_cache_entries.push(InstalledInventoryCacheEntry::from_scan(&jar, resolved));
+        next_cache_entries.push(InstalledInventoryCacheEntry::from_scan(&jar,resolved));
     }
 
     // Save the scan and pass the same entries back to the caller
