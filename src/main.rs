@@ -326,66 +326,118 @@ fn discover_context(
     MinecraftContext::discover_with_game_versions(cwd, known_game_versions)
 }
 
-fn check_loader(context: &MinecraftContext) -> Result<()> {
-    let environment = &context.environment;
-    match &environment.loader {
-        minecraft::Loader::Fabric => check_loader_fabric(environment),
-        loader => bail!("Loader update checks are not supported for {loader}"),
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoaderManifest {
+    game_versions: Vec<LoaderManifestGame>,
+    #[serde(default)]
+    version_groups: Vec<LoaderVersionGroup>,
 }
 
 #[derive(Deserialize)]
-struct FabricLoaderEntry {
-    loader: FabricLoaderVersion,
+#[serde(rename_all = "camelCase")]
+struct LoaderManifestGame {
+    id: String,
+    version_group: Option<String>,
+    loaders: Vec<LoaderRelease>,
 }
 
 #[derive(Deserialize)]
-struct FabricLoaderVersion {
-    version: String,
+struct LoaderVersionGroup {
+    id: String,
+    loaders: Vec<LoaderRelease>,
+}
+
+#[derive(Deserialize)]
+struct LoaderRelease {
+    id: String,
     stable: bool,
 }
 
-fn check_loader_fabric(environment: &DetectedEnvironment) -> Result<()> {
+fn check_loader(context: &MinecraftContext) -> Result<()> {
+    use minecraft::Loader;
+
+    let environment = &context.environment;
+    let loader = &environment.loader;
+    let minecraft_version = &environment.minecraft_version;
     let installed = environment
         .loader_version
         .as_deref()
-        .context("could not determine the installed Fabric Loader version")?;
-    let minecraft_version = &environment.minecraft_version;
+        .with_context(|| format!("could not determine the installed {loader} version"))?;
 
-    // Fetch compatible Fabric Loader versions in newest-first order
-    let game_version = urlencoding::encode(minecraft_version);
-    let url = format!("https://meta.fabricmc.net/v2/versions/loader/{game_version}");
-    let versions: Vec<FabricLoaderEntry> = reqwest::blocking::Client::builder()
+    // Fetch the Modrinth manifest for the detected loader
+    let path = match loader {
+        Loader::Fabric => "fabric/v0",
+        Loader::Quilt => "quilt/v1",
+        Loader::Forge => "forge/v0",
+        Loader::NeoForge => "neo/v0",
+    };
+    let url = format!("https://launcher-meta.modrinth.com/{path}/manifest.json");
+    let manifest: LoaderManifest = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?
         .get(url)
         .send()
-        .context("failed to contact Fabric Meta")?
+        .with_context(|| format!("failed to fetch the {loader} manifest"))?
         .error_for_status()
-        .with_context(|| format!("Fabric Meta lookup failed for Minecraft {minecraft_version}"))?
+        .with_context(|| format!("{loader} manifest request failed"))?
         .json()
-        .context("failed to decode the Fabric Meta response")?;
+        .with_context(|| format!("failed to decode the {loader} manifest"))?;
 
-    // Use Fabric Meta's ordering to compare the installed and stable versions
-    let latest_index = versions
+    // Find the exact Minecraft version before resolving shared loader lists
+    let game = manifest
+        .game_versions
         .iter()
-        .position(|entry| entry.loader.stable)
-        .with_context(|| format!("no stable Fabric Loader found for Minecraft {minecraft_version}"))?;
-    let installed_index = versions
-        .iter()
-        .position(|entry| entry.loader.version == installed)
-        .with_context(|| {
-            format!("Fabric Meta did not list installed version {installed} for Minecraft {minecraft_version}")
-        })?;
-    let latest = &versions[latest_index].loader.version;
+        .find(|game| game.id == *minecraft_version)
+        .with_context(|| format!("no {loader} entry for Minecraft {minecraft_version}"))?;
+    let releases = match (loader, game.version_group.as_deref()) {
+        (Loader::Quilt, Some(group_id)) => {
+            let group = manifest
+                .version_groups
+                .iter()
+                .find(|group| group.id == group_id)
+                .with_context(|| format!("missing Quilt version group {group_id}"))?;
+            &group.loaders
+        }
+        (Loader::Fabric, _) if game.loaders.is_empty() => {
+            // Fabric can store universal releases in one shared entry
+            let mut shared = manifest
+                .game_versions
+                .iter()
+                .filter(|entry| !entry.loaders.is_empty());
+            let entry = shared.next().context("missing shared Fabric loader list")?;
+            if shared.next().is_some() {
+                bail!("could not identify a unique shared Fabric loader list");
+            }
+            &entry.loaders
+        }
+        _ => &game.loaders,
+    };
 
-    if latest_index < installed_index {
-        println!("Fabric Loader {installed} → {latest} available for Minecraft {minecraft_version}");
-    } else {
-        println!(
-            "Fabric Loader {installed} is installed for Minecraft {minecraft_version}. \
-             Latest stable version is {latest}. No update available."
-        );
+    // Use manifest order and infer stable Forge releases from numeric version IDs
+    let latest = releases.first().with_context(|| {
+        format!("no compatible {loader} releases for Minecraft {minecraft_version}")
+    })?;
+    let stable = releases.iter().find(|release| match loader {
+        Loader::Forge | Loader::NeoForge => release
+            .id
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        Loader::Fabric | Loader::Quilt => release.stable,
+    });
+
+    // Show both release choices and compare the installed version
+    println!("Installed {loader} on Minecraft {minecraft_version}: {installed}");
+    println!("Latest compatible: {}", latest.id);
+    match stable {
+        Some(release) => println!("Latest stable: {}", release.id),
+        None => println!("Latest stable: none listed"),
+    }
+
+    match releases.iter().position(|release| release.id == installed) {
+        Some(0) => println!("No loader update available."),
+        Some(_) => println!("Loader update available: {installed} → {}", latest.id),
+        None => println!("The manifest does not list {installed}, so update status is unknown."),
     }
 
     Ok(())
