@@ -563,11 +563,11 @@ fn list_mods(client: &ModrinthClient, context: &MinecraftContext) -> Result<()> 
 
     // Use the same column widths for the borders and rows
     let print_rule = |left, joint, right| {
-        println!("{gray}{left}{name_rule}{joint}{version_rule}{joint}{update_rule}{right}{foreground}");
+        println!("{gray}{left}{update_rule}{joint}{name_rule}{joint}{version_rule}{right}{foreground}");
     };
     let print_row = |name: &str, version: &str, update: &str| {
         println!(
-            "{edge} {name:<name_width$} {edge} {version:<version_width$} {edge} {update:<update_width$} {edge}"
+            "{edge} {update:>update_width$} {edge} {name:<name_width$} {edge} {version:<version_width$} {edge}"
         );
     };
 
