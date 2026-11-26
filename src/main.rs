@@ -71,6 +71,12 @@ enum Command {
         target: Vec<String>,
         #[arg(long, help = "Include beta and alpha mod updates")]
         include_prerelease: bool,
+        #[arg(
+            long,
+            conflicts_with = "include_prerelease",
+            help = "Move every mod to its latest compatible stable release, allowing downgrades"
+        )]
+        sync_stable: bool,
     },
     #[command(alias = "s")]
     Search {
@@ -243,13 +249,17 @@ fn run() -> Result<()> {
         Command::Update {
             target,
             include_prerelease,
+            sync_stable,
         } => {
             let target = join_words(target)?;
+            if sync_stable && !target.eq_ignore_ascii_case("all") {
+                bail!("--sync-stable requires `mod update all`");
+            }
             let known_game_versions = load_known_game_versions(&client);
             let context = discover_context(&cwd, known_game_versions.as_ref())?;
             print_environment(&context.environment, &context.root_dir, &context.mods_dir);
             if target.eq_ignore_ascii_case("all") {
-                update_all(&client, &context, include_prerelease)?;
+                update_all(&client, &context, include_prerelease, sync_stable)?;
             } else {
                 update_named(&client, &context, &target, include_prerelease)?;
             }
@@ -1027,13 +1037,11 @@ fn update_all(
     client: &ModrinthClient,
     context: &MinecraftContext,
     include_prerelease: bool,
+    sync_stable: bool,
 ) -> Result<()> {
     let installed = build_installed_inventory(client, context)?;
     if installed.is_empty() {
-        println!(
-            "No Modrinth-backed mods found in {}",
-            context.mods_dir.display()
-        );
+        println!("No Modrinth-backed mods found in {}", context.mods_dir.display());
         return Ok(());
     }
 
@@ -1044,17 +1052,23 @@ fn update_all(
     let latest_by_hash = client.latest_versions_for_hashes(
         &hashes,
         &context.environment,
-        Some(update_version_types(include_prerelease)),
+        Some(update_version_types(include_prerelease && !sync_stable)),
     )?;
-    let mut updated = 0usize;
+
+    let mut updated = 0;
+    let mut no_stable_release = Vec::new();
 
     for item in installed.into_values() {
         match latest_by_hash.get(&item.jar.sha1) {
-            Some(latest_version) => {
-                if replace_if_newer(client, context, &item, latest_version)? {
-                    updated += 1;
-                }
+            Some(version) => {
+                let changed = if sync_stable {
+                    replace_mod_jar(client, context, &item, version)?
+                } else {
+                    replace_if_newer(client, context, &item, version)?
+                };
+                updated += usize::from(changed);
             }
+            None if sync_stable => no_stable_release.push(item.project.title),
             None => {
                 println!(
                     "Skipped {}: no compatible update found for {} {}",
@@ -1066,7 +1080,16 @@ fn update_all(
         }
     }
 
-    if updated == 0 {
+    if sync_stable {
+        println!("Synced {updated} mod(s) to the latest compatible stable release.");
+        if !no_stable_release.is_empty() {
+            no_stable_release.sort();
+            println!("\nNo compatible stable release found. Kept the installed version for:");
+            for title in no_stable_release {
+                println!("- {title}");
+            }
+        }
+    } else if updated == 0 {
         println!("Everything is already up to date.");
     }
 
@@ -1387,6 +1410,15 @@ fn replace_if_newer(
         return Ok(false);
     }
 
+    replace_mod_jar(client, context, installed, latest_version)
+}
+
+fn replace_mod_jar(
+    client: &ModrinthClient,
+    context: &MinecraftContext,
+    installed: &InstalledMod,
+    latest_version: &Version,
+) -> Result<bool> {
     let latest_file = latest_version.primary_download_file().ok_or_else(|| {
         anyhow!(
             "latest version {} for {} has no downloadable jar",
@@ -1414,12 +1446,25 @@ fn replace_if_newer(
         Some(installed.jar.path.as_path()),
     )?;
 
+    let action = if latest_version.date_published < installed.version.date_published {
+        "Downgraded"
+    } else {
+        "Updated"
+    };
+    let channel_suffix = |version: &Version| {
+        if version.version_type == "release" {
+            " (stable)"
+        } else {
+            prerelease_suffix(version)
+        }
+    };
     println!(
-        "Updated {}: {} -> {}{}",
+        "{action} {}: {}{} → {}{}",
         installed.project.title,
         installed.version.version_number,
+        channel_suffix(&installed.version),
         latest_version.version_number,
-        prerelease_suffix(latest_version),
+        channel_suffix(latest_version),
     );
     Ok(true)
 }
@@ -3219,7 +3264,7 @@ mod tests {
         });
 
         let client = ModrinthClient::new(server.base_url()).unwrap();
-        update_all(&client, &context, false).unwrap();
+        update_all(&client, &context, false, false).unwrap();
 
         assert_eq!(compute_sha1(&installed_path).unwrap(), latest_sha1);
         assert_eq!(beta_download.calls(), 0);
@@ -3247,6 +3292,95 @@ mod tests {
         };
         assert!(!replace_if_newer(&client, &context, &installed, &older).unwrap());
         assert_eq!(fs::read(&installed_path).unwrap(), beta_bytes);
+    }
+
+    #[test]
+    fn sync_stable_upgrades_and_downgrades_to_compatible_releases() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_fabric_root(root);
+        let context = MinecraftContext::discover(root).unwrap();
+        let server = MockServer::start();
+
+        // Install a beta with a stable target, an alpha without one, and a stable mod
+        let installed = [
+            ("sodium", "Sodium", "beta", "installed beta"),
+            ("distant-horizons", "Distant Horizons", "alpha", "installed alpha"),
+            ("lithium", "Lithium", "release", "installed release"),
+        ];
+        let hashes = installed.map(|(_, _, _, contents)| {
+            bytes_to_hex(&Sha1::digest(contents.as_bytes()))
+        });
+        for ((slug, title, channel, contents), hash) in installed.into_iter().zip(&hashes) {
+            let filename = format!("{slug}.jar");
+            fs::write(root.join("mods").join(&filename), contents).unwrap();
+            server.mock(|when, then| {
+                when.method(GET)
+                    .path(format!("/version_file/{hash}"))
+                    .query_param("algorithm", "sha1");
+                then.json_body(mock_version(
+                    slug, slug, "2.0.0", channel, hash, &filename,
+                    &server.url(&format!("/files/{filename}")), json!([]),
+                ));
+            });
+            server.mock(|when, then| {
+                when.method(GET).path(format!("/project/{slug}"));
+                then.json_body(mock_project(slug, slug, title, 1000));
+            });
+        }
+
+        // Return an older release for the beta, a newer release for the stable mod, and no release for the alpha
+        let stable = b"older stable release";
+        let stable_hash = bytes_to_hex(&Sha1::digest(stable));
+        let mut stable_version = mock_version(
+            "sodium-stable", "sodium", "1.0.0", "release", &stable_hash,
+            "sodium-stable.jar", &server.url("/files/sodium-stable.jar"), json!([]),
+        );
+        stable_version["date_published"] = json!("2026-03-27T00:00:00Z");
+        let newer_stable = b"newer stable release";
+        let newer_hash = bytes_to_hex(&Sha1::digest(newer_stable));
+        let mut newer_version = mock_version(
+            "lithium-stable", "lithium", "3.0.0", "release", &newer_hash,
+            "lithium.jar", &server.url("/files/lithium-stable.jar"), json!([]),
+        );
+        newer_version["date_published"] = json!("2026-03-29T00:00:00Z");
+        let lookup = server.mock(|when, then| {
+            when.method(POST)
+                .path("/version_files/update")
+                .body_includes(&hashes[0])
+                .body_includes(&hashes[1])
+                .body_includes(&hashes[2])
+                .body_includes(r#""version_types":["release"]"#);
+            then.json_body(json!({hashes[0].clone(): stable_version, hashes[2].clone(): newer_version}));
+        });
+        let download = server.mock(|when, then| {
+            when.method(GET).path("/files/sodium-stable.jar");
+            then.body(stable);
+        });
+
+        let newer_download = server.mock(|when, then| {
+            when.method(GET).path("/files/lithium-stable.jar");
+            then.body(newer_stable);
+        });
+
+        let client = ModrinthClient::new_with_test_cache(
+            server.base_url(), root.join("api-cache"),
+        ).unwrap();
+        update_all(&client, &context, false, true).unwrap();
+
+        lookup.assert();
+        download.assert();
+        newer_download.assert();
+        assert!(!root.join("mods/sodium.jar").exists());
+        assert_eq!(fs::read(root.join("mods/sodium-stable.jar")).unwrap(), stable);
+        assert_eq!(
+            fs::read(root.join("mods/distant-horizons.jar")).unwrap(),
+            b"installed alpha",
+        );
+        assert_eq!(
+            fs::read(root.join("mods/lithium.jar")).unwrap(),
+            newer_stable,
+        );
     }
 
     #[test]

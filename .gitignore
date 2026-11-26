@@ -13,3 +13,6 @@
 .env
 .env.*
 .envrc
+
+# Small custom script to install it in my machine
+/install.sh
